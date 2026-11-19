@@ -104,7 +104,10 @@ def main() -> None:
         event = json.load(sys.stdin)
         session = event.get("session_id")
         if enabled(session):
-            stop(session)
+            # A background task notification arrives as a prompt too, but only a
+            # prompt the user typed should cut off speech.
+            if not event.get("prompt", "").lstrip().startswith("<task-notification>"):
+                stop(session)
             skip_to_end(session, event.get("transcript_path"))
             print(VOICE_TAGGED if tagged(session) else VOICE_MODE)
     elif cmd == "end":
