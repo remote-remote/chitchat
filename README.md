@@ -10,7 +10,7 @@ Speech plays only while its session is focused in tmux: its pane is the active p
 
 Text in `<announce>...</announce>` speaks right away, whether the session is focused or not. Claude is asked to use it rarely, for an update worth hearing from another session, such as a merge, a failure, or a decision waiting on you. An announcement is read once: in read-along mode it is read in its place in the reply when the session is focused, and when it was already announced, the rest of the reply plays without it on your return. The plugin hides these tags too.
 
-Outside tagged mode, text Claude writes before a tool call is treated as an announcement too: it speaks right away, focused or not, and is never held or repeated when held speech plays. Final replies wait as above. In tagged mode only tagged text speaks, and `<speak>` text waits for focus wherever it was written.
+Outside tagged mode, text Claude writes before a tool call is treated as an announcement too: it speaks as the call starts, focused or not, and is never held or repeated when held speech plays. Final replies wait as above. In tagged mode only tagged text speaks, and `<speak>` text waits for focus wherever it was written.
 
 | Variable | Effect |
 |---|---|
@@ -55,7 +55,7 @@ Control speech with the plugin's `chitchat` skill: type `/chitchat` to turn spee
 
 The script also runs directly, as `scripts/chitchat COMMAND`, where no command means `status`. It finds its session from `CLAUDE_CODE_SESSION_ID`, which commands run by Claude in a session carry, so outside a session only `voice` (to list) and `stop` (which stops every session) work.
 
-Each session speaks its messages in order. Sessions that speak at the same time take turns, and a new prompt silences whatever its session had left to say. Text written between tool calls is spoken as the turn goes on.
+Each session speaks its messages in order. Sessions that speak at the same time take turns, and a new prompt silences whatever its session had left to say. Text written before a tool call is spoken as the call starts, so a turn's progress is heard as it goes on.
 
 ## Music
 
@@ -72,8 +72,8 @@ Spotify is only touched while it is running; chitchat never launches it. The fir
 - `skills/chitchat/SKILL.md`: the skill that runs the script's commands
 - `scripts/chitchat`: the speech engine and command line
 - `scripts/chitchat_test.py`: focus tests, run with `python3 scripts/chitchat_test.py -v`
-- `hooks/hooks.json`: Stop, PreToolUse, UserPromptSubmit, and SessionEnd hooks that call the script; each returns at once while no session has speech on
-- `hooks/register.ts`: a hooks module that strips `<speak>` and `<announce>` tags from drawn replies, leaving the stored transcript, which the script reads, unchanged
+- `hooks/hooks.json`: Stop, UserPromptSubmit, and SessionEnd hooks that call the script; each returns at once while no session has speech on
+- `hooks/register.ts`: a hooks module that strips `<speak>` and `<announce>` tags from drawn replies, leaving the stored transcript, which the script reads, unchanged. It also reads each response as it streams and hands the text written before a tool call to the script as the call starts, since that text reaches the transcript only after the call has run
 
 ## License
 
