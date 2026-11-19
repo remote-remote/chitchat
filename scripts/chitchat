@@ -27,6 +27,10 @@ in the queue otherwise, playing once the session is focused again. Text in
 tool call, outside tagged mode. CHITCHAT_FOCUS=off speaks everything, focused
 or not.
 
+In a Claude Code session, run these through the /chitchat skill: /chitchat
+alone toggles speech, and /chitchat COMMAND runs on, off, toggle, status,
+voice, speed, or stop.
+
   chitchat on|off|toggle|status   enable or disable speech for this session
   chitchat on tagged              speak only text in <speak> or <announce> tags, for an agent the
                                   listener supervises rather than reads along with
@@ -165,7 +169,7 @@ def main() -> None:
 def current_session() -> str:
     session = os.environ.get("CLAUDE_CODE_SESSION_ID")
     if not session:
-        sys.exit("chitchat: run inside a Claude Code session, as `! chitchat on`")
+        sys.exit("chitchat: run inside a Claude Code session, as `/chitchat on`")
     return session
 
 

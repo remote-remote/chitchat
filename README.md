@@ -36,33 +36,30 @@ claude plugin marketplace add ~/code/chitchat
 claude plugin install chitchat@chitchat
 ```
 
-Put the command on your PATH so you can turn speech on from a session:
-
-```
-ln -s ~/code/chitchat/scripts/chitchat ~/.local/bin/chitchat
-```
-
 ## Voices
 
 A voice is a WAV file in `${XDG_DATA_HOME:-~/.local/share}/chitchat/voices`, named for the file: `voices/narrator.wav` is the voice `narrator`. The sample needs more than 5 seconds of clear speech; only the first 15 are used. `default.wav` is used when no voice is chosen, and `CHITCHAT_VOICE` names a different default. Only clone a voice you have the right to use.
 
 ## Use
 
-Run these from a Claude Code session with the `!` prefix:
+Control speech with the plugin's `chitchat` skill: type `/chitchat` to turn speech on or off for this session, or `/chitchat` followed by a command. If another plugin or skill is also named chitchat, use the namespaced form, `/chitchat:chitchat`. Claude can run the skill itself too, so an agent can turn on tagged mode, or you can ask for speech in plain words. The skill only runs `scripts/chitchat` from the plugin folder with the command given.
 
 | Command | Effect |
 |---|---|
-| `! chitchat on` / `off` / `toggle` / `status` | Turn speech on or off for this session |
-| `chitchat on tagged` | Speak only text in `<speak>` or `<announce>` tags. Meant for an agent you supervise rather than read along with: it runs this itself and tags only important updates |
-| `! chitchat voice [NAME]` | List voices, or choose this session's voice |
-| `! chitchat speed [RATE]` | Show or set playback rate, 0.5 to 2 (default 1.1, or `CHITCHAT_SPEED`) |
-| `! chitchat stop` | Stop this session's speech |
+| `/chitchat` | Toggle speech for this session |
+| `/chitchat on` / `off` / `toggle` / `status` | Turn speech on or off for this session, or show whether it is on |
+| `/chitchat on tagged` | Speak only text in `<speak>` or `<announce>` tags. Meant for an agent you supervise rather than read along with: it runs this itself and tags only important updates |
+| `/chitchat voice [NAME]` | List voices, or choose this session's voice |
+| `/chitchat speed [RATE]` | Show or set playback rate, 0.5 to 2 (default 1.1, or `CHITCHAT_SPEED`) |
+| `/chitchat stop` | Stop this session's speech |
+
+The script also runs directly, as `scripts/chitchat COMMAND`, where no command means `status`. It finds its session from `CLAUDE_CODE_SESSION_ID`, which commands run by Claude in a session carry, so outside a session only `voice` (to list) and `stop` (which stops every session) work.
 
 Each session speaks its messages in order. Sessions that speak at the same time take turns, and a new prompt silences whatever its session had left to say. Text written between tool calls is spoken as the turn goes on.
 
 ## Music
 
-While any session speaks, chitchat lowers Spotify's volume and puts it back once no session has anything left to say, so the music stays low between sentences and between sessions taking turns. Speech that is cut off, by a new prompt, `chitchat stop`, `chitchat off`, or the session ending, restores it as well. The volume from before is kept in `${XDG_STATE_HOME:-~/.local/state}/chitchat/ducked`, so if a run is killed before restoring, the next chitchat command restores it. If you change Spotify's volume by hand while it is lowered, chitchat leaves it alone and restores the earlier level when speech ends.
+While any session speaks, chitchat lowers Spotify's volume and puts it back once no session has anything left to say, so the music stays low between sentences and between sessions taking turns. Speech that is cut off, by a new prompt, `stop`, `off`, or the session ending, restores it as well. The volume from before is kept in `${XDG_STATE_HOME:-~/.local/state}/chitchat/ducked`, so if a run is killed before restoring, the next chitchat command restores it. If you change Spotify's volume by hand while it is lowered, chitchat leaves it alone and restores the earlier level when speech ends.
 
 | Variable | Effect |
 |---|---|
@@ -72,6 +69,7 @@ Spotify is only touched while it is running; chitchat never launches it. The fir
 
 ## How it fits together
 
+- `skills/chitchat/SKILL.md`: the skill that runs the script's commands
 - `scripts/chitchat`: the speech engine and command line
 - `scripts/chitchat_test.py`: focus tests, run with `python3 scripts/chitchat_test.py -v`
 - `hooks/hooks.json`: Stop, PreToolUse, UserPromptSubmit, and SessionEnd hooks that call the script; each returns at once while no session has speech on
