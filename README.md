@@ -4,6 +4,18 @@ Claude Code replies, spoken aloud in a voice cloned locally from a short WAV sam
 
 While speech is on, Claude is asked to write one reply that reads well on screen and aloud, since the listener reads along. Code blocks, tables, URLs, and inline code that looks like a path or command are skipped when spoken, so Claude puts a one-sentence description before each code block or table. If a reply wraps text in `<speak>...</speak>`, only that text is spoken, and the plugin hides the tags in the drawn reply.
 
+## Focus
+
+Speech plays only while its session is focused in tmux: its pane is the active pane, its window is the active window, and an attached client of its session is focused. With tmux's `focus-events` on, a client counts as focused only while the terminal app is in front. Speech for a session you are not looking at waits, in order, and plays when you come back to it. Focus is checked as each message comes up, so queued speech pauses once you switch away, and a waiting session checks twice a second for your return. A new prompt in the session clears what it had waiting, as it clears speech already playing. While a session waits, other sessions still speak and Spotify comes back up. Outside tmux, or if tmux cannot answer, a session counts as focused.
+
+Text in `<announce>...</announce>` speaks right away, whether the session is focused or not. Claude is asked to use it rarely, for an update worth hearing from another session, such as a merge, a failure, or a decision waiting on you. An announcement is read once: in read-along mode it is read in its place in the reply when the session is focused, and when it was already announced, the rest of the reply plays without it on your return. The plugin hides these tags too.
+
+Outside tagged mode, text Claude writes before a tool call is treated as an announcement too: it speaks right away, focused or not, and is never held or repeated when held speech plays. Final replies wait as above. In tagged mode only tagged text speaks, and `<speak>` text waits for focus wherever it was written.
+
+| Variable | Effect |
+|---|---|
+| `CHITCHAT_FOCUS` | `off` speaks every session, focused or not (default on) |
+
 ## Requirements
 
 - macOS on Apple Silicon (mlx-audio, and `afplay` for playback)
@@ -41,7 +53,7 @@ Run these from a Claude Code session with the `!` prefix:
 | Command | Effect |
 |---|---|
 | `! chitchat on` / `off` / `toggle` / `status` | Turn speech on or off for this session |
-| `chitchat on tagged` | Speak only text in `<speak>` tags. Meant for an agent you supervise rather than read along with: it runs this itself and tags only important updates |
+| `chitchat on tagged` | Speak only text in `<speak>` or `<announce>` tags. Meant for an agent you supervise rather than read along with: it runs this itself and tags only important updates |
 | `! chitchat voice [NAME]` | List voices, or choose this session's voice |
 | `! chitchat speed [RATE]` | Show or set playback rate, 0.5 to 2 (default 1.1, or `CHITCHAT_SPEED`) |
 | `! chitchat stop` | Stop this session's speech |
@@ -61,8 +73,9 @@ Spotify is only touched while it is running; chitchat never launches it. The fir
 ## How it fits together
 
 - `scripts/chitchat`: the speech engine and command line
+- `scripts/chitchat_test.py`: focus tests, run with `python3 scripts/chitchat_test.py -v`
 - `hooks/hooks.json`: Stop, PreToolUse, UserPromptSubmit, and SessionEnd hooks that call the script; each returns at once while no session has speech on
-- `hooks/register.ts`: a hooks module that strips `<speak>` tags from drawn replies, leaving the stored transcript, which the script reads, unchanged
+- `hooks/register.ts`: a hooks module that strips `<speak>` and `<announce>` tags from drawn replies, leaving the stored transcript, which the script reads, unchanged
 
 ## License
 
