@@ -18,6 +18,8 @@ and uses only the first 15. $CHITCHAT_VOICE names the default voice, and
 $CHITCHAT_SPEED sets the default rate.
 
   chitchat on|off|toggle|status   enable or disable speech for this session
+  chitchat on tagged              speak only text in <speak> tags, for an agent the
+                                  listener supervises rather than reads along with
   chitchat voice [NAME]           list voices, or choose this session's voice
   chitchat speed [RATE]           show or set this session's playback rate
   chitchat stop                   stop this session's speech; outside a session, all
@@ -62,13 +64,20 @@ PLAY_LOCK = STATE / "play.lock"
 SPOKEN = "spoken"
 
 VOICE_MODE = """\
-Voice mode is on: your replies are also read aloud by text-to-speech. Write the reply for \
-the screen as usual; tables, links, paths, and code are fine. Wrap what should be spoken \
-in <speak>...</speak>: the outcome, anything the listener must decide or do, and a pointer \
-to what is on screen, in short plain sentences with numbers written so they read \
-naturally. Only text inside the tags is spoken, and the tags themselves are hidden on \
-screen. A reply with no tags is spoken whole, minus code blocks, tables, URLs, and inline \
-code that looks like a path or command."""
+Voice mode is on: your whole reply is also read aloud by text-to-speech while the \
+listener reads along, so write one reply that works both ways. Code blocks, tables, URLs, \
+and inline code that looks like a path or command are skipped when spoken. Right before a \
+code block or table, write one plain sentence saying what it shows, the way an engineer \
+would point at it, so the listener hears that while reading it. Don't let a path or \
+identifier in inline code carry a sentence's meaning alone, and write numbers so they \
+read naturally."""
+
+VOICE_TAGGED = """\
+Speech is on in tagged mode: only text inside <speak>...</speak> is read aloud, and \
+everything else stays silent. Most replies need no tags. Wrap only an important update \
+in them, such as a finished milestone, a failure, a blocker, or a decision that is \
+needed, in one or two short plain sentences with numbers written so they read naturally. \
+The tags are hidden on screen."""
 
 SPEAK = re.compile(r"<speak>(.*?)(?:</speak>|\Z)", re.S | re.I)
 
@@ -78,7 +87,7 @@ def main() -> None:
     for d in (ENABLED, CHOSEN, SPEEDS, PIDS, LOGS, QUEUES, WORKERS, OFFSETS, VOICES):
         d.mkdir(parents=True, exist_ok=True)
     if cmd in ("on", "off", "toggle", "status"):
-        toggle(cmd, current_session())
+        toggle(cmd, current_session(), sys.argv[2] if len(sys.argv) > 2 else "")
     elif cmd == "voice":
         choose_voice(sys.argv[2] if len(sys.argv) > 2 else None)
     elif cmd == "speed":
@@ -97,7 +106,7 @@ def main() -> None:
         if enabled(session):
             stop(session)
             skip_to_end(session, event.get("transcript_path"))
-            print(VOICE_MODE)
+            print(VOICE_TAGGED if tagged(session) else VOICE_MODE)
     elif cmd == "end":
         session = json.load(sys.stdin).get("session_id")
         if session:
@@ -125,15 +134,24 @@ def enabled(session: str | None) -> bool:
     return bool(session) and (ENABLED / session).exists()
 
 
-def toggle(cmd: str, session: str) -> None:
+def tagged(session: str | None) -> bool:
+    return enabled(session) and (ENABLED / session).read_text().strip() == "tagged"
+
+
+def toggle(cmd: str, session: str, mode: str) -> None:
+    if mode not in ("", "tagged"):
+        sys.exit(f"chitchat: unknown mode {mode!r}; the only mode is tagged")
     if cmd == "toggle":
         cmd = "off" if enabled(session) else "on"
     if cmd == "on":
-        (ENABLED / session).touch()
+        (ENABLED / session).write_text(mode)
     elif cmd == "off":
         (ENABLED / session).unlink(missing_ok=True)
         stop(session)
-    print("speech on" if enabled(session) else "speech off")
+    if not enabled(session):
+        print("speech off")
+    else:
+        print("speech on, tagged" if tagged(session) else "speech on")
 
 
 def voice(session: str) -> str:
@@ -187,14 +205,15 @@ def hook(event: dict) -> None:
     skip_to_end(session, transcript)
     with offsets(session) as saved:
         saved[SPOKEN] = text
-    enqueue(session, speakable("\n".join(pending)))
-    enqueue(session, speakable(text))
+    enqueue(session, speakable("\n".join(pending), tagged(session)))
+    enqueue(session, speakable(text, tagged(session)))
 
 
 def progress(event: dict) -> None:
     session = event.get("session_id")
     if enabled(session):
-        enqueue(session, speakable("\n".join(new_texts(session, event.get("transcript_path")))))
+        found = new_texts(session, event.get("transcript_path"))
+        enqueue(session, speakable("\n".join(found), tagged(session)))
 
 
 def new_texts(session: str, transcript_path: str | None) -> list[str]:
@@ -285,14 +304,18 @@ def texts(message: dict) -> list[str]:
     return [block["text"] for block in content or [] if block.get("type") == "text"]
 
 
-def speakable(md: str) -> str:
-    """Reduce markdown to what reads well aloud: code and tables are dropped, not read."""
+def speakable(md: str, tagged_only: bool = False) -> str:
+    """Reduce markdown to what reads well aloud: code and tables are dropped, not read.
+
+    With tagged_only, text outside <speak> tags is not spoken at all."""
     md = re.sub(r"```.*?(```|\Z)", " ", md, flags=re.S)
     # Text that marks what to say is spoken alone; text without the tags is filtered whole.
     # Inline code that names the tags is about them, not a mark.
     spoken = SPEAK.findall(re.sub(r"`[^`\n]*speak>[^`\n]*`", " ", md, flags=re.I))
     if spoken:
         md = "\n".join(spoken)
+    elif tagged_only:
+        return ""
     lines = []
     for line in md.splitlines():
         if line.lstrip().startswith("|"):

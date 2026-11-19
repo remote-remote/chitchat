@@ -2,7 +2,7 @@
 
 Claude Code replies, spoken aloud in a voice cloned locally from a short WAV sample. Speech runs on your machine with [Chatterbox Turbo](https://huggingface.co/mlx-community/chatterbox-turbo-fp16) through mlx-audio; nothing is sent to a speech service.
 
-While speech is on, Claude is asked to write its reply for the screen as usual and to wrap the part worth hearing in `<speak>...</speak>`. Only that part is spoken, and the plugin hides the tags in the drawn reply. A reply without tags is spoken whole, minus code blocks, tables, URLs, and inline code that looks like a path or command.
+While speech is on, Claude is asked to write one reply that reads well on screen and aloud, since the listener reads along. Code blocks, tables, URLs, and inline code that looks like a path or command are skipped when spoken, so Claude puts a one-sentence description before each code block or table. If a reply wraps text in `<speak>...</speak>`, only that text is spoken, and the plugin hides the tags in the drawn reply.
 
 ## Requirements
 
@@ -41,6 +41,7 @@ Run these from a Claude Code session with the `!` prefix:
 | Command | Effect |
 |---|---|
 | `! chitchat on` / `off` / `toggle` / `status` | Turn speech on or off for this session |
+| `chitchat on tagged` | Speak only text in `<speak>` tags. Meant for an agent you supervise rather than read along with: it runs this itself and tags only important updates |
 | `! chitchat voice [NAME]` | List voices, or choose this session's voice |
 | `! chitchat speed [RATE]` | Show or set playback rate, 0.5 to 2 (default 1.1, or `CHITCHAT_SPEED`) |
 | `! chitchat stop` | Stop this session's speech |
