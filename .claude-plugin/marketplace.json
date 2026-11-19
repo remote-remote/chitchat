@@ -1,0 +1,14 @@
+{
+  "name": "chitchat",
+  "owner": {
+    "name": "remote-remote"
+  },
+  "plugins": [
+    {
+      "name": "chitchat",
+      "source": "./",
+      "description": "Spoken Claude Code replies in a locally cloned voice"
+    }
+  ],
+  "description": "Spoken Claude Code replies in a locally cloned voice"
+}

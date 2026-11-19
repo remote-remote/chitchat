@@ -1,0 +1,47 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$(ls -A \"${XDG_STATE_HOME:-$HOME/.local/state}/chitchat/sessions\" 2>/dev/null)\" ] && \"${CLAUDE_PLUGIN_ROOT}/scripts/chitchat\" hook || true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$(ls -A \"${XDG_STATE_HOME:-$HOME/.local/state}/chitchat/sessions\" 2>/dev/null)\" ] && \"${CLAUDE_PLUGIN_ROOT}/scripts/chitchat\" progress || true"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$(ls -A \"${XDG_STATE_HOME:-$HOME/.local/state}/chitchat/sessions\" 2>/dev/null)\" ] && \"${CLAUDE_PLUGIN_ROOT}/scripts/chitchat\" prompt || true"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$(ls -A \"${XDG_STATE_HOME:-$HOME/.local/state}/chitchat/sessions\" 2>/dev/null)\" ] && \"${CLAUDE_PLUGIN_ROOT}/scripts/chitchat\" end || true"
+          }
+        ]
+      }
+    ]
+  },
+  "modules": [
+    "./register.ts"
+  ]
+}

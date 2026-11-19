@@ -1,0 +1,441 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12,<3.13"
+# dependencies = [
+#   "mlx-audio==0.6.6",
+#   "soundfile==0.14.0",
+# ]
+# ///
+"""Speak Claude Code replies aloud in a voice cloned locally with Chatterbox Turbo.
+
+Speech is enabled per Claude Code session. Each session speaks its messages in
+order, one at a time. Sessions that speak at the same time take turns. A new
+prompt silences whatever its session had left to say.
+
+A voice is a WAV sample in $XDG_DATA_HOME/chitchat/voices, named for its
+file: voices/data.wav is the voice "data". Chatterbox needs more than 5 seconds
+and uses only the first 15. $CHITCHAT_VOICE names the default voice, and
+$CHITCHAT_SPEED sets the default rate.
+
+  chitchat on|off|toggle|status   enable or disable speech for this session
+  chitchat voice [NAME]           list voices, or choose this session's voice
+  chitchat speed [RATE]           show or set this session's playback rate
+  chitchat stop                   stop this session's speech; outside a session, all
+  chitchat hook                   Stop hook: speak the last reply if enabled
+  chitchat progress               PreToolUse hook: speak text written since the last tool call
+  chitchat prompt                 UserPromptSubmit hook: ask for speakable replies
+  chitchat end                    SessionEnd hook: forget the session
+  chitchat say [SESSION]          speak text read from stdin
+"""
+
+import fcntl
+import json
+import os
+import queue
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+MODEL = "mlx-community/chatterbox-turbo-fp16"
+DEFAULT_SPEED = os.environ.get("CHITCHAT_SPEED", "1.1")
+
+DEFAULT_VOICE = os.environ.get("CHITCHAT_VOICE", "default")
+
+DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "chitchat"
+VOICES = DATA / "voices"
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "chitchat"
+ENABLED = STATE / "sessions"
+CHOSEN = STATE / "chosen-voices"
+SPEEDS = STATE / "speeds"
+PIDS = STATE / "pids"
+LOGS = STATE / "logs"
+QUEUES = STATE / "queues"
+WORKERS = STATE / "workers"
+OFFSETS = STATE / "offsets"
+PLAY_LOCK = STATE / "play.lock"
+# Key in a session's offsets for the last reply the Stop hook spoke; real keys are paths.
+SPOKEN = "spoken"
+
+VOICE_MODE = """\
+Voice mode is on: your replies are also read aloud by text-to-speech. Write the reply for \
+the screen as usual; tables, links, paths, and code are fine. Wrap what should be spoken \
+in <speak>...</speak>: the outcome, anything the listener must decide or do, and a pointer \
+to what is on screen, in short plain sentences with numbers written so they read \
+naturally. Only text inside the tags is spoken, and the tags themselves are hidden on \
+screen. A reply with no tags is spoken whole, minus code blocks, tables, URLs, and inline \
+code that looks like a path or command."""
+
+SPEAK = re.compile(r"<speak>(.*?)(?:</speak>|\Z)", re.S | re.I)
+
+
+def main() -> None:
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    for d in (ENABLED, CHOSEN, SPEEDS, PIDS, LOGS, QUEUES, WORKERS, OFFSETS, VOICES):
+        d.mkdir(parents=True, exist_ok=True)
+    if cmd in ("on", "off", "toggle", "status"):
+        toggle(cmd, current_session())
+    elif cmd == "voice":
+        choose_voice(sys.argv[2] if len(sys.argv) > 2 else None)
+    elif cmd == "speed":
+        choose_speed(sys.argv[2] if len(sys.argv) > 2 else None)
+    elif cmd == "stop":
+        session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+        for s in [session] if session else [p.name for p in PIDS.iterdir()]:
+            stop(s)
+    elif cmd == "hook":
+        hook(json.load(sys.stdin))
+    elif cmd == "progress":
+        progress(json.load(sys.stdin))
+    elif cmd == "prompt":
+        event = json.load(sys.stdin)
+        session = event.get("session_id")
+        if enabled(session):
+            stop(session)
+            skip_to_end(session, event.get("transcript_path"))
+            print(VOICE_MODE)
+    elif cmd == "end":
+        session = json.load(sys.stdin).get("session_id")
+        if session:
+            (ENABLED / session).unlink(missing_ok=True)
+            (OFFSETS / session).unlink(missing_ok=True)
+            (CHOSEN / session).unlink(missing_ok=True)
+            (SPEEDS / session).unlink(missing_ok=True)
+            stop(session)
+    elif cmd == "say":
+        enqueue(sys.argv[2] if len(sys.argv) > 2 else "manual", sys.stdin.read())
+    elif cmd == "worker":
+        worker(sys.argv[2])
+    else:
+        sys.exit(__doc__)
+
+
+def current_session() -> str:
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not session:
+        sys.exit("chitchat: run inside a Claude Code session, as `! chitchat on`")
+    return session
+
+
+def enabled(session: str | None) -> bool:
+    return bool(session) and (ENABLED / session).exists()
+
+
+def toggle(cmd: str, session: str) -> None:
+    if cmd == "toggle":
+        cmd = "off" if enabled(session) else "on"
+    if cmd == "on":
+        (ENABLED / session).touch()
+    elif cmd == "off":
+        (ENABLED / session).unlink(missing_ok=True)
+        stop(session)
+    print("speech on" if enabled(session) else "speech off")
+
+
+def voice(session: str) -> str:
+    chosen = CHOSEN / session
+    return chosen.read_text().strip() if chosen.exists() else DEFAULT_VOICE
+
+
+def choose_voice(name: str | None) -> None:
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if name is None:
+        current = voice(session) if session else DEFAULT_VOICE
+        for v in sorted(f.stem for f in VOICES.glob("*.wav")):
+            print(f"{'*' if v == current else ' '} {v}")
+        return
+    if not (VOICES / f"{name}.wav").exists():
+        sys.exit(f"chitchat: no voice {name!r} in {VOICES}")
+    (CHOSEN / current_session()).write_text(name)
+    print(f"voice {name}")
+
+
+def speed(session: str) -> str:
+    chosen = SPEEDS / session
+    return chosen.read_text().strip() if chosen.exists() else DEFAULT_SPEED
+
+
+def choose_speed(rate: str | None) -> None:
+    session = current_session()
+    if rate is not None:
+        try:
+            ok = 0.5 <= float(rate) <= 2
+        except ValueError:
+            ok = False
+        if not ok:
+            sys.exit("chitchat: speed is a rate from 0.5 to 2")
+        (SPEEDS / session).write_text(rate)
+    print(f"speed {speed(session)}")
+
+
+def hook(event: dict) -> None:
+    session = event.get("session_id")
+    if not enabled(session):
+        return
+    transcript = event.get("transcript_path")
+    text = event.get("last_assistant_message") or last_reply(transcript) or ""
+    # A step's text reaches the transcript only after its tool call has run, so
+    # progress() speaks each step one call late, and the last step is spoken here.
+    pending = [t for t in new_texts(session, transcript) if t.strip() not in text]
+    # The final reply is spoken from the event, so progress() must not speak it again.
+    # Skipping to the end is not enough: the reply can reach the transcript after this
+    # hook runs, and a ! command fires no prompt hook to skip past it later.
+    skip_to_end(session, transcript)
+    with offsets(session) as saved:
+        saved[SPOKEN] = text
+    enqueue(session, speakable("\n".join(pending)))
+    enqueue(session, speakable(text))
+
+
+def progress(event: dict) -> None:
+    session = event.get("session_id")
+    if enabled(session):
+        enqueue(session, speakable("\n".join(new_texts(session, event.get("transcript_path")))))
+
+
+def new_texts(session: str, transcript_path: str | None) -> list[str]:
+    """Assistant text added to the transcript since this session last read it.
+
+    The offset is kept per transcript path, since a subagent's tool calls may
+    report its own transcript. With no offset yet, nothing is read, so turning
+    speech on mid-session does not replay the history."""
+    if not transcript_path:
+        return []
+    with offsets(session) as saved:
+        start = saved.get(transcript_path)
+        with open(transcript_path, "rb") as f:
+            if start is None or start > os.fstat(f.fileno()).st_size:
+                saved[transcript_path] = f.seek(0, os.SEEK_END)
+                return []
+            f.seek(start)
+            data = f.read()
+        # A line still being written is left for the next read.
+        end = data.rfind(b"\n") + 1
+        saved[transcript_path] = start + end
+        spoken = saved.get(SPOKEN, "")
+    found = []
+    for line in data[:end].splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("type") == "assistant" and not entry.get("isSidechain"):
+            found += [t for t in texts(entry["message"]) if t.strip() not in spoken]
+    return found
+
+
+def skip_to_end(session: str, transcript_path: str | None) -> None:
+    if not transcript_path:
+        return
+    with offsets(session) as saved:
+        try:
+            saved[transcript_path] = os.path.getsize(transcript_path)
+        except FileNotFoundError:
+            pass
+
+
+class offsets:
+    """The session's transcript offsets, read and written under a lock, since
+    parallel tool calls run their hooks at the same time."""
+
+    def __init__(self, session: str):
+        self.path = OFFSETS / session
+
+    def __enter__(self) -> dict:
+        self.file = open(self.path, "a+")
+        fcntl.flock(self.file, fcntl.LOCK_EX)
+        self.file.seek(0)
+        try:
+            self.saved = json.loads(self.file.read() or "{}")
+        except json.JSONDecodeError:
+            self.saved = {}
+        return self.saved
+
+    def __exit__(self, *exc) -> None:
+        self.file.seek(0)
+        self.file.truncate()
+        json.dump(self.saved, self.file)
+        self.file.close()
+
+
+def last_reply(transcript_path: str | None) -> str:
+    """Text of the final assistant message; one message can span several JSONL entries."""
+    if not transcript_path:
+        return ""
+    entries = []
+    with open(transcript_path) as f:
+        for line in f:
+            entry = json.loads(line)
+            if entry.get("type") == "assistant":
+                entries.append(entry["message"])
+    last_id = next((m.get("id") for m in reversed(entries) if texts(m)), None)
+    if last_id is None:
+        return ""
+    return "\n".join(t for m in entries if m.get("id") == last_id for t in texts(m))
+
+
+def texts(message: dict) -> list[str]:
+    content = message.get("content")
+    if isinstance(content, str):
+        return [content]
+    return [block["text"] for block in content or [] if block.get("type") == "text"]
+
+
+def speakable(md: str) -> str:
+    """Reduce markdown to what reads well aloud: code and tables are dropped, not read."""
+    md = re.sub(r"```.*?(```|\Z)", " ", md, flags=re.S)
+    # Text that marks what to say is spoken alone; text without the tags is filtered whole.
+    # Inline code that names the tags is about them, not a mark.
+    spoken = SPEAK.findall(re.sub(r"`[^`\n]*speak>[^`\n]*`", " ", md, flags=re.I))
+    if spoken:
+        md = "\n".join(spoken)
+    lines = []
+    for line in md.splitlines():
+        if line.lstrip().startswith("|"):
+            continue
+        line = re.sub(r"^\s*(#+|[-*+]|\d+\.)\s+", "", line)
+        lines.append(line)
+    text = "\n".join(lines)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"https?://\S+", "", text)
+    # Inline code that is a path, command, or identifier is noise when spoken.
+    text = re.sub(r"`([^`]*)`", lambda m: "" if re.search(r"[/\\=<>{}()]|^-|\.\w+$", m[1]) else m[1], text)
+    text = re.sub(r"[*_]{1,3}([^*_\n]+)[*_]{1,3}", r"\1", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\n{2,}", "\n", text).strip()
+
+
+def enqueue(session: str, text: str) -> None:
+    """Add text to the session's queue and make sure a worker is speaking it."""
+    if not text:
+        return
+    pending = QUEUES / session
+    pending.mkdir(exist_ok=True)
+    item = pending / f"{time.time_ns()}.txt"
+    item.with_suffix(".tmp").write_text(text)
+    item.with_suffix(".tmp").rename(item)
+    # A worker that is already running exits at once; see worker() for why that is safe.
+    subprocess.Popen(
+        [sys.executable, __file__, "worker", session],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def worker(session: str) -> None:
+    """Speak the session's queue in order until it is empty.
+
+    Only the worker holding the session's lock speaks. After releasing it, the
+    worker looks at the queue once more: an item added while it held the lock
+    found the lock taken and started no worker of its own, so this one must
+    take it."""
+    pending = QUEUES / session
+    model = None
+    loaded_voice = None
+    logging = False
+    while True:
+        with open(WORKERS / session, "w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            (PIDS / session).write_text(str(os.getpid()))
+            if not logging:
+                # Each worker replaces the session's log, so it holds only its own output.
+                log = os.open(LOGS / session, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+                os.dup2(log, 1)
+                os.dup2(log, 2)
+                logging = True
+            while item := next_item(pending):
+                text = item.read_text()
+                item.unlink()
+                if model is None:
+                    model = load()
+                # The choice is read per item, so a change applies from the next message.
+                if (name := voice(session)) != loaded_voice:
+                    model.prepare_conditionals(str(VOICES / f"{name}.wav"))
+                    loaded_voice = name
+                speak(model, text, session)
+            pidfile = PIDS / session
+            if pidfile.exists() and pidfile.read_text() == str(os.getpid()):
+                pidfile.unlink()
+        if not next_item(pending):
+            return
+
+
+def next_item(pending: Path) -> Path | None:
+    items = sorted(pending.glob("*.txt")) if pending.exists() else []
+    return items[0] if items else None
+
+
+def load():
+    from mlx_audio.tts.utils import load_model
+
+    return load_model(MODEL)
+
+
+def speak(model, text: str, session: str) -> None:
+    import soundfile
+
+    clips: queue.Queue[Path | None] = queue.Queue()
+    player = threading.Thread(target=play, args=(clips, session))
+    player.start()
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            # Each line is generated on its own, so playback starts after the first
+            # line and the gap between clips, mostly afplay startup, falls at a line
+            # break. Turbo still splits a line longer than about 400 characters.
+            lines = [line for line in text.splitlines() if line.strip()]
+            results = (r for line in lines for r in model.generate(text=line))
+            for i, result in enumerate(results):
+                clip = Path(tmp) / f"{i}.wav"
+                soundfile.write(clip, result.audio, result.sample_rate)
+                clips.put(clip)
+        finally:
+            clips.put(None)
+            player.join()
+
+
+def play(clips: queue.Queue, session: str) -> None:
+    clip = clips.get()
+    if clip is None:
+        return
+    # Sessions take turns. Generation keeps going while this waits, and the lock is
+    # released when the process exits, including when stop() kills it.
+    with open(PLAY_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        while clip is not None:
+            # Turbo has no speed control, so playback sets the rate.
+            subprocess.run(["afplay", "-r", speed(session), "-q", "1", str(clip)])
+            clip = clips.get()
+
+
+def stop(session: str) -> None:
+    """Drop the session's queue and kill its worker, with any afplay it started."""
+    for item in (QUEUES / session).glob("*.txt"):
+        item.unlink(missing_ok=True)
+    pidfile = PIDS / session
+    try:
+        pid = int(pidfile.read_text())
+    except (FileNotFoundError, ValueError):
+        return
+    pidfile.unlink(missing_ok=True)
+    if pid == os.getpid():
+        return
+    # Guard against a reused pid: only kill a process that is still chitchat.
+    ps = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True)
+    if "chitchat" in ps.stdout:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+if __name__ == "__main__":
+    main()

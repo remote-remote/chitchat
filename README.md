@@ -1,0 +1,58 @@
+# chitchat
+
+Claude Code replies, spoken aloud in a voice cloned locally from a short WAV sample. Speech runs on your machine with [Chatterbox Turbo](https://huggingface.co/mlx-community/chatterbox-turbo-fp16) through mlx-audio; nothing is sent to a speech service.
+
+While speech is on, Claude is asked to write its reply for the screen as usual and to wrap the part worth hearing in `<speak>...</speak>`. Only that part is spoken, and the plugin hides the tags in the drawn reply. A reply without tags is spoken whole, minus code blocks, tables, URLs, and inline code that looks like a path or command.
+
+## Requirements
+
+- macOS on Apple Silicon (mlx-audio, and `afplay` for playback)
+- [uv](https://docs.astral.sh/uv/), which installs the script's Python dependencies on first run
+- Claude Code with plugin hooks modules; the first spoken reply downloads the model
+
+## Install
+
+```
+/plugin install chitchat --marketplace remote-remote/chitchat
+```
+
+To edit it in place instead, clone the repository and add the clone as a folder marketplace, which Claude Code reads directly; `/reload-plugins` picks up changes:
+
+```
+git clone https://github.com/remote-remote/chitchat ~/code/chitchat
+claude plugin marketplace add ~/code/chitchat
+claude plugin install chitchat@chitchat
+```
+
+Put the command on your PATH so you can turn speech on from a session:
+
+```
+ln -s ~/code/chitchat/scripts/chitchat ~/.local/bin/chitchat
+```
+
+## Voices
+
+A voice is a WAV file in `${XDG_DATA_HOME:-~/.local/share}/chitchat/voices`, named for the file: `voices/narrator.wav` is the voice `narrator`. The sample needs more than 5 seconds of clear speech; only the first 15 are used. `default.wav` is used when no voice is chosen, and `CHITCHAT_VOICE` names a different default. Only clone a voice you have the right to use.
+
+## Use
+
+Run these from a Claude Code session with the `!` prefix:
+
+| Command | Effect |
+|---|---|
+| `! chitchat on` / `off` / `toggle` / `status` | Turn speech on or off for this session |
+| `! chitchat voice [NAME]` | List voices, or choose this session's voice |
+| `! chitchat speed [RATE]` | Show or set playback rate, 0.5 to 2 (default 1.1, or `CHITCHAT_SPEED`) |
+| `! chitchat stop` | Stop this session's speech |
+
+Each session speaks its messages in order. Sessions that speak at the same time take turns, and a new prompt silences whatever its session had left to say. Text written between tool calls is spoken as the turn goes on.
+
+## How it fits together
+
+- `scripts/chitchat`: the speech engine and command line
+- `hooks/hooks.json`: Stop, PreToolUse, UserPromptSubmit, and SessionEnd hooks that call the script; each returns at once while no session has speech on
+- `hooks/register.ts`: a hooks module that strips `<speak>` tags from drawn replies, leaving the stored transcript, which the script reads, unchanged
+
+## License
+
+MIT
