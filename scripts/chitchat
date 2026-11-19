@@ -17,6 +17,10 @@ file: voices/data.wav is the voice "data". Chatterbox needs more than 5 seconds
 and uses only the first 15. $CHITCHAT_VOICE names the default voice, and
 $CHITCHAT_SPEED sets the default rate.
 
+While any session speaks, a running Spotify is lowered to $CHITCHAT_DUCK percent
+(default 30), and restored once nothing is left to speak; CHITCHAT_DUCK=off
+leaves Spotify alone.
+
   chitchat on|off|toggle|status   enable or disable speech for this session
   chitchat on tagged              speak only text in <speak> tags, for an agent the
                                   listener supervises rather than reads along with
@@ -47,6 +51,7 @@ MODEL = "mlx-community/chatterbox-turbo-fp16"
 DEFAULT_SPEED = os.environ.get("CHITCHAT_SPEED", "1.1")
 
 DEFAULT_VOICE = os.environ.get("CHITCHAT_VOICE", "default")
+DUCK_LEVEL = os.environ.get("CHITCHAT_DUCK", "30")
 
 DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "chitchat"
 VOICES = DATA / "voices"
@@ -60,6 +65,10 @@ QUEUES = STATE / "queues"
 WORKERS = STATE / "workers"
 OFFSETS = STATE / "offsets"
 PLAY_LOCK = STATE / "play.lock"
+# Spotify's volume from before speech lowered it, kept until it is restored, so a run
+# that is killed or crashes is restored by the next one.
+DUCKED = STATE / "ducked"
+DUCK_LOCK = STATE / "duck.lock"
 # Key in a session's offsets for the last reply the Stop hook spoke; real keys are paths.
 SPOKEN = "spoken"
 
@@ -86,6 +95,8 @@ def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     for d in (ENABLED, CHOSEN, SPEEDS, PIDS, LOGS, QUEUES, WORKERS, OFFSETS, VOICES):
         d.mkdir(parents=True, exist_ok=True)
+    if cmd != "worker" and DUCKED.exists():
+        restore()
     if cmd in ("on", "off", "toggle", "status"):
         toggle(cmd, current_session(), sys.argv[2] if len(sys.argv) > 2 else "")
     elif cmd == "voice":
@@ -392,6 +403,7 @@ def worker(session: str) -> None:
             if pidfile.exists() and pidfile.read_text() == str(os.getpid()):
                 pidfile.unlink()
         if not next_item(pending):
+            restore()
             return
 
 
@@ -436,6 +448,7 @@ def play(clips: queue.Queue, session: str) -> None:
     # released when the process exits, including when stop() kills it.
     with open(PLAY_LOCK, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        duck()
         while clip is not None:
             # Turbo has no speed control, so playback sets the rate.
             subprocess.run(["afplay", "-r", speed(session), "-q", "1", str(clip)])
@@ -446,6 +459,11 @@ def stop(session: str) -> None:
     """Drop the session's queue and kill its worker, with any afplay it started."""
     for item in (QUEUES / session).glob("*.txt"):
         item.unlink(missing_ok=True)
+    kill_worker(session)
+    restore()
+
+
+def kill_worker(session: str) -> None:
     pidfile = PIDS / session
     try:
         pid = int(pidfile.read_text())
@@ -454,13 +472,88 @@ def stop(session: str) -> None:
     pidfile.unlink(missing_ok=True)
     if pid == os.getpid():
         return
-    # Guard against a reused pid: only kill a process that is still chitchat.
-    ps = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True)
-    if "chitchat" in ps.stdout:
+    if is_chitchat(pid):
         try:
             os.killpg(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
+
+
+def is_chitchat(pid: int) -> bool:
+    """Guards against a reused pid: true only for a process that is still chitchat."""
+    ps = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True)
+    return "chitchat" in ps.stdout
+
+
+def duck_level() -> int | None:
+    if DUCK_LEVEL.strip().lower() == "off":
+        return None
+    try:
+        return min(max(int(DUCK_LEVEL), 0), 100)
+    except ValueError:
+        return None
+
+
+def duck() -> None:
+    """Lower Spotify for speech. Ducking is global: the first speaker saves the
+    volume and lowers it, and later speakers find it saved and leave it alone."""
+    level = duck_level()
+    if level is None:
+        return
+    with open(DUCK_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if DUCKED.exists():
+            return
+        volume = spotify_volume()
+        if volume is None:
+            return
+        # Saved before lowering, so a crash in between restores a volume, not loses one.
+        DUCKED.write_text(str(volume))
+        if volume > level:
+            spotify_volume(level)
+
+
+def restore() -> None:
+    """Put Spotify back at its saved volume once no session has speech playing or
+    queued. A volume the user changed while ducked is overwritten, not fought."""
+    with open(DUCK_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not DUCKED.exists() or speaking():
+            return
+        try:
+            spotify_volume(int(DUCKED.read_text()))
+        except ValueError:
+            pass
+        DUCKED.unlink()
+
+
+def speaking() -> bool:
+    """Whether any session has a live worker or queued text."""
+    for pidfile in PIDS.glob("*"):
+        try:
+            if is_chitchat(int(pidfile.read_text())):
+                return True
+        except (FileNotFoundError, ValueError):
+            pass
+    return any(QUEUES.glob("*/*.txt")) or any(QUEUES.glob("*/*.tmp"))
+
+
+def spotify_volume(level: int | None = None) -> int | None:
+    """Spotify's volume, after setting it to level if given. None when Spotify is
+    not running, since asking it would launch it."""
+    set_volume = f"set sound volume to {level}\n" if level is not None else ""
+    script = (
+        'if application "Spotify" is running then\n'
+        f'tell application "Spotify"\n{set_volume}return sound volume\nend tell\n'
+        "end if"
+    )
+    try:
+        out = subprocess.run(
+            ["osascript", "-e", script], capture_output=True, text=True, timeout=10
+        ).stdout.strip()
+        return int(out)
+    except (subprocess.TimeoutExpired, ValueError):
+        return None
 
 
 if __name__ == "__main__":

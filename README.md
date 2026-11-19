@@ -48,6 +48,16 @@ Run these from a Claude Code session with the `!` prefix:
 
 Each session speaks its messages in order. Sessions that speak at the same time take turns, and a new prompt silences whatever its session had left to say. Text written between tool calls is spoken as the turn goes on.
 
+## Music
+
+While any session speaks, chitchat lowers Spotify's volume and puts it back once no session has anything left to say, so the music stays low between sentences and between sessions taking turns. Speech that is cut off, by a new prompt, `chitchat stop`, `chitchat off`, or the session ending, restores it as well. The volume from before is kept in `${XDG_STATE_HOME:-~/.local/state}/chitchat/ducked`, so if a run is killed before restoring, the next chitchat command restores it. If you change Spotify's volume by hand while it is lowered, chitchat leaves it alone and restores the earlier level when speech ends.
+
+| Variable | Effect |
+|---|---|
+| `CHITCHAT_DUCK` | Spotify's volume while speaking, 0 to 100 (default 30), or `off` to leave Spotify alone |
+
+Spotify is only touched while it is running; chitchat never launches it. The first time, macOS asks once for permission to let your terminal control Spotify.
+
 ## How it fits together
 
 - `scripts/chitchat`: the speech engine and command line
