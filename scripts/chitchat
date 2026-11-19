@@ -24,8 +24,8 @@ leaves Spotify alone.
 Ordinary speech plays only while its session's tmux pane is focused, and waits
 in the queue otherwise, playing once the session is focused again. Text in
 <announce> tags speaks right away regardless, and so does text written before a
-tool call, outside tagged mode. CHITCHAT_FOCUS=off speaks everything, focused
-or not.
+tool call, outside tagged mode, as the call starts. CHITCHAT_FOCUS=off speaks
+everything, focused or not.
 
 In a Claude Code session, run these through the /chitchat skill: /chitchat
 alone toggles speech, and /chitchat COMMAND runs on, off, toggle, status,
@@ -38,8 +38,8 @@ voice, speed, or stop.
   chitchat speed [RATE]           show or set this session's playback rate
   chitchat stop                   stop this session's speech; outside a session, all
   chitchat hook                   Stop hook: speak the last reply if enabled
-  chitchat progress               PreToolUse hook: speak text written since the last tool call,
-                                  focused or not
+  chitchat pretool                speak text written before a tool call, given as a JSON list
+                                  on stdin by the hooks module as the call starts, focused or not
   chitchat prompt                 UserPromptSubmit hook: ask for speakable replies
   chitchat end                    SessionEnd hook: forget the session
   chitchat say [SESSION]          speak text read from stdin, focused or not
@@ -84,8 +84,10 @@ PLAY_LOCK = STATE / "play.lock"
 # that is killed or crashes is restored by the next one.
 DUCKED = STATE / "ducked"
 DUCK_LOCK = STATE / "duck.lock"
-# Key in a session's offsets for the last reply the Stop hook spoke; real keys are paths.
+# Keys in a session's offsets; real keys are paths. SPOKEN is the last reply the Stop
+# hook spoke, and SAID the texts pretool spoke this turn.
 SPOKEN = "spoken"
+SAID = "said"
 
 VOICE_MODE = """\
 Voice mode is on: your whole reply is also read aloud by text-to-speech while the \
@@ -135,8 +137,8 @@ def main() -> None:
             stop(s)
     elif cmd == "hook":
         hook(json.load(sys.stdin))
-    elif cmd == "progress":
-        progress(json.load(sys.stdin))
+    elif cmd == "pretool":
+        pretool(os.environ.get("CLAUDE_CODE_SESSION_ID"), json.load(sys.stdin))
     elif cmd == "prompt":
         event = json.load(sys.stdin)
         session = event.get("session_id")
@@ -147,6 +149,9 @@ def main() -> None:
                 stop(session)
             remember_pane(session)
             skip_to_end(session, event.get("transcript_path"))
+            # A turn cut off before its Stop hook leaves what pretool() said behind.
+            with offsets(session) as saved:
+                saved.pop(SAID, None)
             print(VOICE_TAGGED if tagged(session) else VOICE_MODE)
     elif cmd == "end":
         session = json.load(sys.stdin).get("session_id")
@@ -240,10 +245,12 @@ def hook(event: dict) -> None:
         return
     transcript = event.get("transcript_path")
     text = event.get("last_assistant_message") or last_reply(transcript) or ""
-    # A step's text reaches the transcript only after its tool call has run, so
-    # progress() speaks each step one call late, and the last step is spoken here.
-    pending = [t for t in new_texts(session, transcript) if t.strip() not in text]
-    # The final reply is spoken from the event, so progress() must not speak it again.
+    with offsets(session) as saved:
+        said = saved.pop(SAID, [])
+    # Text written before a tool call was spoken by pretool() as the call started. Any
+    # left is text the hooks module did not see, spoken late rather than not at all.
+    pending = [t for t in new_texts(session, transcript) if t.strip() not in text and t.strip() not in said]
+    # The final reply is spoken from the event, so a later Stop hook must not speak it again.
     # Skipping to the end is not enough: the reply can reach the transcript after this
     # hook runs, and a ! command fires no prompt hook to skip past it later.
     skip_to_end(session, transcript)
@@ -251,15 +258,21 @@ def hook(event: dict) -> None:
         saved[SPOKEN] = text
     remember_pane(session)
     enqueue(session, *pre_tool("\n".join(pending), tagged(session)))
-    enqueue(session, *speakable(text, tagged(session)))
+    # A turn whose last message has no text falls back to an earlier one, which can be
+    # text pretool() already spoke.
+    if text.strip() not in said:
+        enqueue(session, *speakable(text, tagged(session)))
 
 
-def progress(event: dict) -> None:
-    session = event.get("session_id")
-    if enabled(session):
-        found = new_texts(session, event.get("transcript_path"))
-        remember_pane(session)
-        enqueue(session, *pre_tool("\n".join(found), tagged(session)))
+def pretool(session: str | None, texts: list[str]) -> None:
+    """Speak text the hooks module read from a response as one of its tool calls began,
+    and note it, so the Stop hook does not speak it again from the transcript."""
+    if not enabled(session):
+        return
+    with offsets(session) as saved:
+        saved[SAID] = [*saved.get(SAID, []), *(t.strip() for t in texts)]
+    remember_pane(session)
+    enqueue(session, *pre_tool("\n".join(texts), tagged(session)))
 
 
 def pre_tool(md: str, tagged_only: bool) -> tuple[str, str, str]:

@@ -121,9 +121,12 @@ class FocusTest(unittest.TestCase):
         with self.transcript.open("a") as f:
             f.write(json.dumps(entry) + "\n")
 
-    def tool_call(self):
-        self.log.append("PreToolUse hook")
-        chitchat.progress({"session_id": SESSION, "transcript_path": str(self.transcript)})
+    def tool_call(self, text):
+        """A step that writes text, then calls a tool: the hooks module hands the text
+        to pretool as the call starts, and it reaches the transcript once the call has run."""
+        self.log.append("tool call starts")
+        chitchat.pretool(SESSION, [text])
+        self.write(text)
 
     def stop_hook(self, reply):
         self.log.append("Stop hook")
@@ -266,32 +269,43 @@ class FocusTest(unittest.TestCase):
     def test_pre_tool_text_speaks_while_unfocused_and_is_not_repeated(self):
         self.focus(OTHER_APP)
         self.start_turn()
-        self.write("Reading the config.")
-        self.tool_call()
-        self.write("Running the tests.")
-        # The last step reaches the Stop hook unspoken, and is pre-tool text too.
+        self.tool_call("Reading the config.")
+        self.tool_call("Running the tests.")
         self.write("All twelve tests pass.")
         self.stop_hook("All twelve tests pass.")
         self.on_wait = lambda waits: self.focus(FOCUSED)
         chitchat.worker(SESSION)
-        self.tool_call()  # a later tool call finds nothing new to say
-        chitchat.worker(SESSION)
         self.assertEqual([line for line in self.log if "spotify" not in line], [
             "tmux: ['11', 'attached,UTF-8']",
-            "PreToolUse hook",
+            "tool call starts",
+            "tool call starts",
             "Stop hook",
             f"{SESSION} says 'Reading the config.'",
             f"{SESSION} says 'Running the tests.'",
             f"{SESSION} waits",
             "tmux: ['11', 'attached,focused,UTF-8']",
             f"{SESSION} says 'All twelve tests pass.'",
-            "PreToolUse hook",
         ])
 
     def test_pre_tool_text_focused_speaks_once(self):
         self.start_turn()
+        self.tool_call("Reading the config.")
+        self.write("Done.")
+        self.stop_hook("Done.")
+        chitchat.worker(SESSION)
+        self.assertEqual(self.said(), [f"{SESSION} says 'Reading the config.'", f"{SESSION} says 'Done.'"])
+
+    def test_pre_tool_text_is_not_repeated_when_the_last_message_has_none(self):
+        self.start_turn()
+        self.tool_call("Reading the config.")
+        # With no text in the last message, the Stop hook falls back to the last that had some.
+        self.stop_hook("")
+        chitchat.worker(SESSION)
+        self.assertEqual(self.said(), [f"{SESSION} says 'Reading the config.'"])
+
+    def test_text_the_module_missed_speaks_at_the_end(self):
+        self.start_turn()
         self.write("Reading the config.")
-        self.tool_call()
         self.write("Done.")
         self.stop_hook("Done.")
         chitchat.worker(SESSION)
@@ -300,12 +314,9 @@ class FocusTest(unittest.TestCase):
     def test_pre_tool_text_in_tagged_mode_is_still_gated(self):
         self.focus(OTHER_PANE)
         self.start_turn(tagged=True)
-        self.write("Looking around. <speak>Halfway there.</speak>")
-        self.tool_call()
-        self.write("Untagged step.")
-        self.tool_call()
-        self.write("<announce>Need your decision.</announce>")
-        self.tool_call()
+        self.tool_call("Looking around. <speak>Halfway there.</speak>")
+        self.tool_call("Untagged step.")
+        self.tool_call("<announce>Need your decision.</announce>")
         self.on_wait = lambda waits: self.focus(FOCUSED)
         chitchat.worker(SESSION)
         self.assertEqual(self.said(), [
