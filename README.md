@@ -12,6 +12,10 @@ Text in `<announce>...</announce>` speaks right away, whether the session is foc
 
 Outside tagged mode, text Claude writes before a tool call is treated as an announcement too: it speaks as the call starts, focused or not, and is never held or repeated when held speech plays. Final replies wait as above. In tagged mode only tagged text speaks, and `<speak>` text waits for focus wherever it was written.
 
+## Which session is speaking
+
+When an announcement or text written before a tool call plays while its session is not focused, chitchat says the session's name first, on a line of its own so a short pause follows it, as in "buckets search fix. The pull request merged." The name is the session's tmux window name, read when the speech plays, with a leading `fm-` dropped and dashes read as spaces, so a worker window `fm-buckets-search-fix` is "buckets search fix". `/chitchat name NAME` sets a different name for the session, `/chitchat name` shows it, and `/chitchat name --clear` goes back to the window name. Speech from a focused session, and held speech that plays once you return, is said without a name. Outside tmux, or if tmux cannot answer, nothing is said first.
+
 | Variable | Effect |
 |---|---|
 | `CHITCHAT_FOCUS` | `off` speaks every session, focused or not (default on) |
@@ -51,6 +55,7 @@ Control speech with the plugin's `chitchat` skill: type `/chitchat` to turn spee
 | `/chitchat on tagged` | Speak only text in `<speak>` or `<announce>` tags. Meant for an agent you supervise rather than read along with: it runs this itself and tags only important updates |
 | `/chitchat voice [NAME]` | List voices, or choose this session's voice |
 | `/chitchat speed [RATE]` | Show or set playback rate, 0.5 to 2 (default 1.1, or `CHITCHAT_SPEED`) |
+| `/chitchat name [NAME]` | Show or set the name said before this session's speech while it is not focused; `name --clear` goes back to the tmux window name |
 | `/chitchat stop` | Stop this session's speech |
 
 The script also runs directly, as `scripts/chitchat COMMAND`, where no command means `status`. It finds its session from `CLAUDE_CODE_SESSION_ID`, which commands run by Claude in a session carry, so outside a session only `voice` (to list) and `stop` (which stops every session) work.
@@ -71,7 +76,7 @@ Spotify is only touched while it is running; chitchat never launches it. The fir
 
 - `skills/chitchat/SKILL.md`: the skill that runs the script's commands
 - `scripts/chitchat`: the speech engine and command line
-- `scripts/chitchat_test.py`: focus tests, run with `python3 scripts/chitchat_test.py -v`
+- `scripts/chitchat_test.py`: focus and naming tests, run with `python3 scripts/chitchat_test.py -v`
 - `hooks/hooks.json`: Stop, UserPromptSubmit, and SessionEnd hooks that call the script; each returns at once while no session has speech on
 - `hooks/register.ts`: a hooks module that strips `<speak>` and `<announce>` tags from drawn replies, leaving the stored transcript, which the script reads, unchanged. It also reads each response as it streams and hands the text written before a tool call to the script as the call starts, since that text reaches the transcript only after the call has run
 

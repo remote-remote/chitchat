@@ -27,15 +27,21 @@ in the queue otherwise, playing once the session is focused again. Text in
 tool call, outside tagged mode, as the call starts. CHITCHAT_FOCUS=off speaks
 everything, focused or not.
 
+Speech that plays while its session is not focused starts with the session's
+name. The name is the tmux window's, with a leading fm- dropped and dashes read as
+spaces, unless `chitchat name` sets one.
+
 In a Claude Code session, run these through the /chitchat skill: /chitchat
 alone toggles speech, and /chitchat COMMAND runs on, off, toggle, status,
-voice, speed, or stop.
+voice, speed, name, or stop.
 
   chitchat on|off|toggle|status   enable or disable speech for this session
   chitchat on tagged              speak only text in <speak> or <announce> tags, for an agent the
                                   listener supervises rather than reads along with
   chitchat voice [NAME]           list voices, or choose this session's voice
   chitchat speed [RATE]           show or set this session's playback rate
+  chitchat name [NAME|--clear]    show or set the name said before this session's speech
+                                  while it is not focused; --clear goes back to the window name
   chitchat stop                   stop this session's speech; outside a session, all
   chitchat hook                   Stop hook: speak the last reply if enabled
   chitchat pretool                speak text written before a tool call, given as a JSON list
@@ -56,6 +62,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 MODEL = "mlx-community/chatterbox-turbo-fp16"
@@ -71,6 +78,7 @@ STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "
 ENABLED = STATE / "sessions"
 CHOSEN = STATE / "chosen-voices"
 SPEEDS = STATE / "speeds"
+NAMES = STATE / "names"
 PIDS = STATE / "pids"
 LOGS = STATE / "logs"
 QUEUES = STATE / "queues"
@@ -121,7 +129,7 @@ POLL_SECONDS = 0.5
 
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
-    for d in (ENABLED, CHOSEN, SPEEDS, PIDS, LOGS, QUEUES, WORKERS, OFFSETS, PANES, HELD, VOICES):
+    for d in (ENABLED, CHOSEN, SPEEDS, NAMES, PIDS, LOGS, QUEUES, WORKERS, OFFSETS, PANES, HELD, VOICES):
         d.mkdir(parents=True, exist_ok=True)
     if cmd != "worker" and DUCKED.exists():
         restore()
@@ -131,6 +139,8 @@ def main() -> None:
         choose_voice(sys.argv[2] if len(sys.argv) > 2 else None)
     elif cmd == "speed":
         choose_speed(sys.argv[2] if len(sys.argv) > 2 else None)
+    elif cmd == "name":
+        choose_name(" ".join(sys.argv[2:]).strip() or None)
     elif cmd == "stop":
         session = os.environ.get("CLAUDE_CODE_SESSION_ID")
         for s in [session] if session else [p.name for p in PIDS.iterdir()]:
@@ -160,6 +170,7 @@ def main() -> None:
             (OFFSETS / session).unlink(missing_ok=True)
             (CHOSEN / session).unlink(missing_ok=True)
             (SPEEDS / session).unlink(missing_ok=True)
+            (NAMES / session).unlink(missing_ok=True)
             (PANES / session).unlink(missing_ok=True)
             stop(session)
     elif cmd == "say":
@@ -237,6 +248,27 @@ def choose_speed(rate: str | None) -> None:
             sys.exit("chitchat: speed is a rate from 0.5 to 2")
         (SPEEDS / session).write_text(rate)
     print(f"speed {speed(session)}")
+
+
+def name(session: str, window: str) -> str:
+    """The name said before the session's unfocused speech: the one chosen, or else
+    the window's. Worker windows are named fm-<task-id>."""
+    chosen = NAMES / session
+    if chosen.exists():
+        return chosen.read_text().strip()
+    return window.removeprefix("fm-").replace("-", " ").strip()
+
+
+def choose_name(new: str | None) -> None:
+    session = current_session()
+    if new == "--clear":
+        (NAMES / session).unlink(missing_ok=True)
+    elif new is not None:
+        (NAMES / session).write_text(new)
+    pane = os.environ.get("TMUX_PANE")
+    window = tmux_pane(pane, tmux_socket()) if pane else None
+    current = name(session, read_pane(window).window if window else "")
+    print(f"name {current}" if current else "no name; outside tmux, nothing is said first")
 
 
 def hook(event: dict) -> None:
@@ -460,9 +492,9 @@ def worker(session: str) -> None:
         if model is None:
             model = load()
         # The choice is read per item, so a change applies from the next message.
-        if (name := voice(session)) != loaded_voice:
-            model.prepare_conditionals(str(VOICES / f"{name}.wav"))
-            loaded_voice = name
+        if (chosen := voice(session)) != loaded_voice:
+            model.prepare_conditionals(str(VOICES / f"{chosen}.wav"))
+            loaded_voice = chosen
         speak(model, text, session)
 
     while True:
@@ -480,11 +512,15 @@ def worker(session: str) -> None:
                 logging = True
             while item := next_item(pending):
                 (HELD / session).unlink(missing_ok=True)
-                if focused(session):
+                where = pane(session)
+                if where.focused:
                     say(take(item))
                     continue
                 for waiting in sorted(pending.glob("*.txt")):
-                    say(take_announcement(waiting))
+                    if text := take_announcement(waiting):
+                        who = name(session, where.window)
+                        # A line of its own is a clip of its own, so a pause follows the name.
+                        say(f"{who}.\n{text}" if who else text)
                 # A held session counts as silent, so other sessions play and the
                 # music comes back up while this one waits; play() ducks it again.
                 (HELD / session).touch()
@@ -539,36 +575,49 @@ def remember_pane(session: str) -> None:
     if not pane:
         (PANES / session).unlink(missing_ok=True)
         return
-    socket = os.environ.get("TMUX", "").split(",")[0]
-    (PANES / session).write_text(json.dumps({"pane": pane, "socket": socket}))
+    (PANES / session).write_text(json.dumps({"pane": pane, "socket": tmux_socket()}))
 
 
-def focused(session: str) -> bool:
-    """Whether the session's pane is the active pane of the active window, with a
-    focused client attached. Outside tmux, or when tmux cannot say, it counts as
-    focused."""
-    if not FOCUS_GATE:
-        return True
+def tmux_socket() -> str:
+    return os.environ.get("TMUX", "").split(",")[0]
+
+
+@dataclass
+class Pane:
+    focused: bool
+    window: str = ""
+
+
+def pane(session: str) -> Pane:
+    """The session's tmux pane: whether it is the active pane of the active window
+    with a focused client attached, and its window's name. Outside tmux, or when
+    tmux cannot say, it counts as focused, with no name."""
     try:
         where = json.loads((PANES / session).read_text())
     except (FileNotFoundError, json.JSONDecodeError):
-        return True
-    out = tmux_focus(where["pane"], where.get("socket", ""))
-    return True if out is None else focused_in(out)
+        return Pane(True)
+    out = tmux_pane(where["pane"], where.get("socket", ""))
+    if out is None:
+        return Pane(True)
+    found = read_pane(out)
+    return found if FOCUS_GATE else Pane(True, found.window)
 
 
-def focused_in(out: str) -> bool:
-    """Read tmux_focus's answer. client_flags is a comma-separated list, such as
+def read_pane(out: str) -> Pane:
+    """Read tmux_pane's answer. client_flags is a comma-separated list, such as
     attached,focused,UTF-8; tmux has no client_focused format to read instead."""
-    active, *clients = out.splitlines() or [""]
-    return active == "11" and any("focused" in flags.split(",") for flags in clients)
+    first, *clients = out.splitlines() or [""]
+    active, _, window = first.partition("\t")
+    focused = active == "11" and any("focused" in flags.split(",") for flags in clients)
+    return Pane(focused, window)
 
 
-def tmux_focus(pane: str, socket: str) -> str | None:
-    """tmux's answer for the pane: a line with pane_active and window_active, then
-    client_flags for each client attached to its session. None if tmux fails."""
+def tmux_pane(pane: str, socket: str) -> str | None:
+    """tmux's answer for the pane: a line with pane_active and window_active, a tab,
+    and the window name, then client_flags for each client attached to its session.
+    None if tmux fails."""
     cmd = ["tmux", *(["-S", socket] if socket else [])]
-    cmd += ["display-message", "-p", "-t", pane, "#{pane_active}#{window_active}"]
+    cmd += ["display-message", "-p", "-t", pane, "#{pane_active}#{window_active}\t#{window_name}"]
     cmd += [";", "list-clients", "-t", pane, "-F", "#{client_flags}"]
     try:
         run = subprocess.run(cmd, capture_output=True, text=True, timeout=5)

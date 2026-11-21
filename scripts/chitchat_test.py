@@ -1,4 +1,4 @@
-"""Focus gating tests, with tmux replaced by a stub of tmux_focus.
+"""Focus gating and naming tests, with tmux replaced by a stub of tmux_pane.
 
 The worker runs for real, with generation and playback, Spotify, and the poll's
 sleep replaced, and each test checks the log of what it said and when it waited.
@@ -27,8 +27,9 @@ loader.exec_module(chitchat)
 
 SESSION = "session-a"
 OTHER = "session-b"
-# tmux_focus answers in tmux 3.7b's shape: pane_active and window_active, then
-# client_flags for each attached client.
+# Focus states as tmux 3.7b reports them: pane_active and window_active, then
+# client_flags for each attached client. The stub adds a tab and the window name
+# to the first line, as tmux_pane's format asks.
 FOCUSED = "11\nattached,focused,UTF-8\n"
 OTHER_PANE = "01\nattached,focused,UTF-8\n"
 OTHER_WINDOW = "10\nattached,focused,UTF-8\n"
@@ -44,11 +45,12 @@ class FakeModel:
 
 class FocusTest(unittest.TestCase):
     def setUp(self):
-        for d in (chitchat.PANES, chitchat.QUEUES, chitchat.PIDS, chitchat.LOGS, chitchat.WORKERS, chitchat.HELD):
+        for d in (chitchat.PANES, chitchat.NAMES, chitchat.QUEUES, chitchat.PIDS, chitchat.LOGS, chitchat.WORKERS, chitchat.HELD):
             d.mkdir(parents=True, exist_ok=True)
-        for f in [*chitchat.PANES.iterdir(), *chitchat.HELD.iterdir(), chitchat.DUCKED]:
+        for f in [*chitchat.PANES.iterdir(), *chitchat.NAMES.iterdir(), *chitchat.HELD.iterdir(), chitchat.DUCKED]:
             f.unlink(missing_ok=True)
         self.tmux = FOCUSED
+        self.window = "chitchat"
         self.calls = []
         self.log = []
         self.waits = 0
@@ -56,7 +58,7 @@ class FocusTest(unittest.TestCase):
         self.on_say = lambda text: None
         self.volume = 80
         patches = [
-            mock.patch.object(chitchat, "tmux_focus", self.fake_tmux),
+            mock.patch.object(chitchat, "tmux_pane", self.fake_tmux),
             mock.patch.object(chitchat, "spotify_volume", self.fake_spotify),
             mock.patch.object(chitchat, "load", FakeModel),
             mock.patch.object(chitchat, "speak", self.fake_speak),
@@ -77,7 +79,10 @@ class FocusTest(unittest.TestCase):
 
     def fake_tmux(self, pane, socket):
         self.calls.append((pane, socket))
-        return self.tmux
+        if self.tmux is None:
+            return None
+        active, *clients = self.tmux.splitlines()
+        return "\n".join([f"{active}\t{self.window}", *clients]) + "\n"
 
     def fake_spotify(self, level=None):
         if level is not None:
@@ -137,12 +142,25 @@ class FocusTest(unittest.TestCase):
         return [line for line in self.log if " says " in line]
 
     def test_reads_client_flags(self):
-        self.assertTrue(chitchat.focused_in(FOCUSED))
-        self.assertTrue(chitchat.focused_in("11\nattached,UTF-8\nattached,focused,UTF-8\n"))
-        self.assertTrue(chitchat.focused_in("11\nfocused\n"))
+        self.assertTrue(chitchat.read_pane(FOCUSED).focused)
+        self.assertTrue(chitchat.read_pane("11\nattached,UTF-8\nattached,focused,UTF-8\n").focused)
+        self.assertTrue(chitchat.read_pane("11\nfocused\n").focused)
         for out in (OTHER_PANE, OTHER_WINDOW, OTHER_APP, DETACHED, "", "11\n\n", "11\nattached,unfocused,UTF-8\n"):
             with self.subTest(out=out):
-                self.assertFalse(chitchat.focused_in(out))
+                self.assertFalse(chitchat.read_pane(out).focused)
+
+    def test_reads_window(self):
+        # A detached session's answer, as tmux 3.7b gives it for a background window.
+        self.assertEqual(
+            chitchat.read_pane("10\tfm-buckets-search-fix\n"),
+            chitchat.Pane(False, "fm-buckets-search-fix"),
+        )
+        self.assertEqual(chitchat.read_pane("11\tmy\twindow\n").window, "my\twindow")
+
+    def test_name_comes_from_the_window(self):
+        self.assertEqual(chitchat.name(SESSION, "fm-buckets-search-fix"), "buckets search fix")
+        self.assertEqual(chitchat.name(SESSION, "chitchat"), "chitchat")
+        self.assertEqual(chitchat.name(SESSION, ""), "")
 
     def test_focused_speaks_whole_reply(self):
         self.reply("Fixed the parser. <announce>Merged the fix.</announce> Tests pass.")
@@ -176,6 +194,21 @@ class FocusTest(unittest.TestCase):
         chitchat.worker(SESSION)
         self.assertEqual(self.said(), [f"{SESSION} says 'Fixed the parser.'"])
         self.assertEqual(self.calls, [])
+
+    def test_no_tmux_announcement_has_no_name(self):
+        for case in ("not in tmux", "tmux fails"):
+            with self.subTest(case=case):
+                self.log.clear()
+                if case == "not in tmux":
+                    os.environ.pop("TMUX_PANE", None)
+                else:
+                    os.environ["TMUX_PANE"] = "%7"
+                    self.tmux = None
+                self.reply("<announce>The pull request merged.</announce>")
+                chitchat.worker(SESSION)
+                self.assertEqual([line for line in self.log if "spotify" not in line], [
+                    f"{SESSION} says 'The pull request merged.'",
+                ])
 
     def test_tmux_failure_speaks(self):
         self.tmux = None
@@ -214,10 +247,10 @@ class FocusTest(unittest.TestCase):
         chitchat.worker(SESSION)
         self.assertEqual([line for line in self.log if "spotify" not in line], [
             "tmux: ['11', 'attached,UTF-8']",
-            f"{SESSION} says 'PR 12 merged.'",
-            f"{SESSION} says 'The build failed.'",
+            f"{SESSION} says 'chitchat.\\nPR 12 merged.'",
+            f"{SESSION} says 'chitchat.\\nThe build failed.'",
             f"{SESSION} waits",
-            f"{SESSION} says 'Waiting on your decision.'",
+            f"{SESSION} says 'chitchat.\\nWaiting on your decision.'",
             f"{SESSION} waits",
             "tmux: ['11', 'attached,focused,UTF-8']",
             f"{SESSION} says 'Fixed the parser. Tests pass.'",
@@ -280,8 +313,8 @@ class FocusTest(unittest.TestCase):
             "tool call starts",
             "tool call starts",
             "Stop hook",
-            f"{SESSION} says 'Reading the config.'",
-            f"{SESSION} says 'Running the tests.'",
+            f"{SESSION} says 'chitchat.\\nReading the config.'",
+            f"{SESSION} says 'chitchat.\\nRunning the tests.'",
             f"{SESSION} waits",
             "tmux: ['11', 'attached,focused,UTF-8']",
             f"{SESSION} says 'All twelve tests pass.'",
@@ -320,7 +353,7 @@ class FocusTest(unittest.TestCase):
         self.on_wait = lambda waits: self.focus(FOCUSED)
         chitchat.worker(SESSION)
         self.assertEqual(self.said(), [
-            f"{SESSION} says 'Need your decision.'",
+            f"{SESSION} says 'chitchat.\\nNeed your decision.'",
             f"{SESSION} says 'Halfway there.'",
         ])
 
@@ -328,6 +361,69 @@ class FocusTest(unittest.TestCase):
         self.reply("<speak>Step done.</speak> Details. <announce>Waiting on you.</announce>", tagged=True)
         chitchat.worker(SESSION)
         self.assertEqual(self.said(), [f"{SESSION} says 'Step done.\\nWaiting on you.'"])
+
+    def test_unfocused_announcement_says_the_name(self):
+        self.window = "fm-buckets-search-fix"
+        self.focus(OTHER_WINDOW)
+        self.reply("Checked CI. <announce>The pull request merged.</announce>")
+        self.on_wait = lambda waits: self.focus(FOCUSED)
+        chitchat.worker(SESSION)
+        self.assertEqual([line for line in self.log if "spotify" not in line], [
+            "tmux: ['10', 'attached,focused,UTF-8']",
+            f"{SESSION} says 'buckets search fix.\\nThe pull request merged.'",
+            f"{SESSION} waits",
+            "tmux: ['11', 'attached,focused,UTF-8']",
+            f"{SESSION} says 'Checked CI.'",
+        ])
+
+    def test_focused_announcement_has_no_name(self):
+        self.window = "fm-buckets-search-fix"
+        self.reply("<announce>The pull request merged.</announce>")
+        chitchat.worker(SESSION)
+        self.assertEqual([line for line in self.log if "spotify" not in line], [
+            f"{SESSION} says 'The pull request merged.'",
+        ])
+
+    def test_unfocused_pre_tool_text_says_the_name(self):
+        self.window = "fm-buckets-search-fix"
+        self.focus(OTHER_APP)
+        self.start_turn()
+        self.tool_call("Running the tests.")
+        self.on_wait = lambda waits: self.focus(FOCUSED)
+        chitchat.worker(SESSION)
+        self.assertEqual(self.said(), [f"{SESSION} says 'buckets search fix.\\nRunning the tests.'"])
+
+    def test_chosen_name_overrides_the_window(self):
+        self.window = "fm-buckets-search-fix"
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": SESSION}), mock.patch("builtins.print"):
+            chitchat.choose_name("buckets")
+            self.on_wait = lambda waits: self.focus(FOCUSED)
+            self.focus(OTHER_PANE)
+            self.reply("<announce>Done.</announce>")
+            chitchat.worker(SESSION)
+            self.assertEqual(self.said(), [f"{SESSION} says 'buckets.\\nDone.'"])
+            self.log.clear()
+            chitchat.choose_name("--clear")
+            self.focus(OTHER_PANE)
+            self.reply("<announce>Done again.</announce>")
+            chitchat.worker(SESSION)
+            self.assertEqual(self.said(), [f"{SESSION} says 'buckets search fix.\\nDone again.'"])
+
+    def test_name_command_shows_the_name(self):
+        self.window = "fm-buckets-search-fix"
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": SESSION}), \
+                mock.patch("builtins.print") as printed:
+            chitchat.choose_name(None)
+            chitchat.choose_name("Buckets")
+            chitchat.choose_name("--clear")
+            del os.environ["TMUX_PANE"]
+            chitchat.choose_name(None)
+        self.assertEqual([c.args[0] for c in printed.call_args_list], [
+            "name buckets search fix",
+            "name Buckets",
+            "name buckets search fix",
+            "no name; outside tmux, nothing is said first",
+        ])
 
     def test_gate_off(self):
         self.tmux = OTHER_PANE
