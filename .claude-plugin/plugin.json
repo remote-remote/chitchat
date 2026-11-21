@@ -1,6 +1,6 @@
 {
   "name": "chitchat",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "Claude Code replies, spoken aloud in a voice cloned locally; only the parts marked <speak> are said, and the tags are hidden on screen",
   "author": {
     "name": "remote-remote"

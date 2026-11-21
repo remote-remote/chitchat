@@ -40,9 +40,9 @@ Speech that plays while its session is not focused starts with the session's
 name. The name is the tmux window's, with a leading fm- dropped and dashes read as
 spaces, unless `chitchat name` sets one.
 
-In a Claude Code session, run these through the /chitchat skill: /chitchat
-alone toggles speech, and /chitchat COMMAND runs on, off, toggle, status,
-voice, speed, name, or stop.
+In a Claude Code session, /chitchat runs these without a model turn: /chitchat
+alone toggles speech, and /chitchat COMMAND runs on, off, toggle, status, voice,
+speed, name, stop, or server. An agent runs the script directly.
 
   chitchat on|off|toggle|status   enable or disable speech for this session
   chitchat on tagged              speak only text in <speak> or <announce> tags, for an agent the
@@ -52,6 +52,7 @@ voice, speed, name, or stop.
   chitchat name [NAME|--clear]    show or set the name said before this session's speech
                                   while it is not focused; --clear goes back to the window name
   chitchat stop                   stop this session's speech; outside a session, all
+  chitchat server                 show the speech server's state, without starting one
   chitchat hook                   Stop hook: speak the last reply if enabled
   chitchat pretool                speak text written before a tool call, given as a JSON list
                                   on stdin by the hooks module as the call starts, focused or not
@@ -209,6 +210,8 @@ def main() -> None:
         enqueue(sys.argv[2] if len(sys.argv) > 2 else "manual", text, text, "")
     elif cmd == "serve":
         serve()
+    elif cmd == "server":
+        print(server_status(send({"op": "status"})))
     else:
         sys.exit(__doc__)
 
@@ -565,6 +568,45 @@ def launch() -> None:
         os.close(log)
 
 
+def server_status(reply: dict | None) -> str:
+    """The server's status reply as lines for a person, or that none is running."""
+    if reply is None:
+        return "No chitchat server is running; the next speech starts one."
+    if "pid" not in reply:
+        # A server from before the status request took it as a ring.
+        old = reply.get("version", "unknown")
+        return f"A chitchat server {old} is running, older than this plugin's {VERSION}; it exits once it finishes what it is saying, and the next speech starts {VERSION}."
+    lines = [f"chitchat server {reply['version']}, pid {reply['pid']}, up {duration(reply['uptime'])}"]
+    if reply["idle_exit"] is None:
+        lines.append("Stays while speech is queued.")
+    else:
+        lines.append(f"Exits in {duration(reply['idle_exit'])} unless more speech arrives.")
+    lines.append(f"Voices ready: {', '.join(reply['voices']) or 'none yet'}")
+    here = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    for session, held in reply["sessions"].items():
+        label = f"{held['name']} ({session})" if held["name"] else session
+        if session == here:
+            label += ", this session"
+        speaking = ", speaking" if session == reply["speaking"] else ""
+        lines.append(f"{label}: {held['queued']} queued, {held['held']} held for focus{speaking}")
+    if reply["speaking"] and reply["speaking"] not in reply["sessions"]:
+        lines.append(f"{reply['speaking']}: speaking its last item")
+    if not reply["sessions"] and not reply["speaking"]:
+        lines.append("Nothing queued.")
+    return "\n".join(lines)
+
+
+def duration(seconds: float) -> str:
+    seconds = int(seconds)
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
 def newer(version: str, than: str) -> bool:
     def parts(v: str) -> tuple[int, ...]:
         return tuple(int(n) for n in re.findall(r"\d+", v))
@@ -717,7 +759,7 @@ class Server:
         # The session whose item is being said, while one is.
         self.current: str | None = None
         self.player: subprocess.Popen | None = None
-        self.last_active = time.monotonic()
+        self.started = self.last_active = time.monotonic()
         self.model = None
         # Each voice's prepared conditionals, with the sample's mtime they came from.
         self.voices: dict[str, tuple[int, object]] = {}
@@ -787,8 +829,10 @@ class Server:
                 pass
 
     def handle(self, request: dict) -> dict:
-        """Answer one request: a ring, which only wakes the scheduler, or a stop.
-        Either one from a newer client closes this server."""
+        """Answer one request: a ring, which only wakes the scheduler, a stop, or a
+        status. A ring or stop from a newer client closes this server."""
+        if request.get("op") == "status":
+            return self.status()
         with self.lock:
             self.last_active = time.monotonic()
             if request.get("op") == "stop":
@@ -798,6 +842,38 @@ class Server:
                 self.closing = True
         self.wake.set()
         return {"version": self.version, "restart": restart}
+
+    def status(self) -> dict:
+        """What the server holds, for `chitchat server`. It leaves the idle clock
+        alone, and reads tmux outside the lock so the scheduler is not held up."""
+        with self.lock:
+            uptime = time.monotonic() - self.started
+            idle_for = time.monotonic() - self.last_active
+            current = self.current
+            voices = sorted(self.voices)
+        counts: dict[str, int] = {}
+        for session, _ in queued():
+            counts[session] = counts.get(session, 0) + 1
+        sessions = {}
+        for session, count in sorted(counts.items()):
+            found = pane(session)
+            sessions[session] = {
+                "name": name(session, found.window),
+                "queued": count if found.focused else 0,
+                "held": 0 if found.focused else count,
+            }
+        # The server stays while anything is queued or being said.
+        idle_exit = None if current or counts else max(IDLE_SECONDS - idle_for, 0.0)
+        return {
+            "version": self.version,
+            "restart": False,
+            "pid": os.getpid(),
+            "uptime": uptime,
+            "idle_exit": idle_exit,
+            "speaking": current,
+            "voices": voices,
+            "sessions": sessions,
+        }
 
     def stop(self, session: str | None) -> None:
         """Drop the session's queue, or every session's with None, and cut its

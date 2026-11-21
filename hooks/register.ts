@@ -1,4 +1,5 @@
 import type { EngineInterface, Register } from 'claude-code'
+import { chitchatArgs, commandText } from './command'
 import { PreToolText } from './pretool'
 import { stripVoiceTags } from './strip'
 
@@ -6,6 +7,23 @@ import { stripVoiceTags } from './strip'
 const PRETOOL = `[ -n "$(ls -A "\${XDG_STATE_HOME:-$HOME/.local/state}/chitchat/sessions" 2>/dev/null)" ] && exec "$0" pretool || true`
 
 export const register: Register = on => {
+  on('session.start', async ($, e, next) => {
+    await $.command.register({
+      name: 'chitchat',
+      description: 'Turn speech on or off for this session, or set its voice, speed, or name',
+      argumentHint: '[on [tagged] | off | toggle | status | voice [NAME] | speed [RATE] | name [NAME | --clear] | stop | server]',
+      immediate: true,
+    })
+    return next(e)
+  })
+
+  // Answered here, not by the model, so it costs no turn and runs mid-turn.
+  on('command.run', { command: 'chitchat' }, async ($, e) => {
+    const env = await $.process.hookEnv()
+    const run = await $.process.run([`${$.plugin.root}/scripts/chitchat`, ...chitchatArgs(e.args)], { env })
+    return { text: commandText(run), isTextDisplayOnly: true }
+  })
+
   on('ui.render', { component: 'AssistantMessage' }, ($, e, next) => {
     const text = stripVoiceTags(e.props.text)
     return text === e.props.text ? next(e) : next({ ...e, props: { ...e.props, text } })

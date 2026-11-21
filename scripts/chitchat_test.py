@@ -8,6 +8,7 @@ Run with: python3 scripts/chitchat_test.py -v
 """
 
 import importlib.machinery
+import io
 import importlib.util
 import json
 import os
@@ -788,6 +789,71 @@ class ServerTest(Base):
             (chitchat.VERSION, "Second."),
             (chitchat.VERSION, "From the new plugin."),
         ])
+
+    def test_status_reports_queued_and_held_per_session(self):
+        server, _ = self.start()
+        self.hold.clear()
+        self.reply("Being said.")
+        self.until(lambda: len(self.spoken) == 1)
+        self.reply("Next up.")
+        self.panes["%9"] = OTHER_PANE
+        self.windows["%9"] = "fm-other-task"
+        self.reply("Waits for focus.", session=OTHER, pane="%9")
+        self.reply("Also waits.", session=OTHER, pane="%9")
+        server.voices["narrator"] = (0, None)
+        status = chitchat.send({"op": "status"})
+        self.assertEqual(status["pid"], os.getpid())
+        self.assertEqual(status["version"], chitchat.VERSION)
+        self.assertEqual(status["speaking"], SESSION)
+        self.assertEqual(status["voices"], ["default", "narrator"])
+        self.assertIsNone(status["idle_exit"])
+        self.assertEqual(status["sessions"], {
+            SESSION: {"name": "chitchat", "queued": 1, "held": 0},
+            OTHER: {"name": "other task", "queued": 0, "held": 2},
+        })
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": OTHER}):
+            text = chitchat.server_status(status)
+        self.assertIn(f"chitchat server {chitchat.VERSION}, pid {os.getpid()}", text)
+        self.assertIn("Stays while speech is queued.", text)
+        self.assertIn(f"chitchat ({SESSION}): 1 queued, 0 held for focus, speaking", text)
+        self.assertIn(f"other task ({OTHER}), this session: 0 queued, 2 held for focus", text)
+
+    def test_status_counts_down_to_idle_exit_without_resetting_it(self):
+        with mock.patch.object(chitchat, "IDLE_SECONDS", 600):
+            server, _ = self.start()
+            server.last_active -= 100
+            status = chitchat.send({"op": "status"})
+            self.assertAlmostEqual(status["idle_exit"], 500, delta=5)
+            self.assertGreaterEqual(status["uptime"], 0)
+            self.assertEqual(status["sessions"], {})
+            self.assertLess(server.last_active, time.monotonic() - 99)
+        text = chitchat.server_status(status)
+        self.assertIn("Exits in 8m", text)
+        self.assertIn("Voices ready: none yet", text)
+        self.assertIn("Nothing queued.", text)
+
+    def test_status_from_a_newer_client_keeps_the_server(self):
+        server, threads = self.start("0.0.1")
+        status = chitchat.send({"op": "status"})
+        self.assertFalse(status["restart"])
+        self.assertFalse(server.closing)
+        self.assertEqual(self.launches, 0)
+
+    def test_status_with_no_server_starts_none(self):
+        self.assertIsNone(chitchat.send({"op": "status"}))
+        self.assertEqual(self.launches, 0)
+        self.assertEqual(chitchat.server_status(None), "No chitchat server is running; the next speech starts one.")
+
+    def test_server_command_on_an_older_server_starts_none(self):
+        self.start("0.0.1")
+        # A server from before the status request takes it as a ring.
+        handle = chitchat.Server.handle
+        with mock.patch.object(chitchat.Server, "handle", lambda server, r: handle(server, {**r, "op": "ring"})):
+            out = io.StringIO()
+            with mock.patch.object(sys, "argv", ["chitchat", "server"]), mock.patch.object(sys, "stdout", out):
+                chitchat.main()
+        self.assertIn("older than this plugin's", out.getvalue())
+        self.assertEqual(self.launches, 0)
 
     def test_restores_spotify_left_lowered_by_a_dead_server(self):
         chitchat.DUCKED.write_text("70")
