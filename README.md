@@ -46,7 +46,7 @@ A voice is a WAV file in `${XDG_DATA_HOME:-~/.local/share}/chitchat/voices`, nam
 
 ## Use
 
-Control speech with the plugin's `chitchat` skill: type `/chitchat` to turn speech on or off for this session, or `/chitchat` followed by a command. If another plugin or skill is also named chitchat, use the namespaced form, `/chitchat:chitchat`. Claude can run the skill itself too, so an agent can turn on tagged mode, or you can ask for speech in plain words. The skill only runs `scripts/chitchat` from the plugin folder with the command given.
+Type `/chitchat` to turn speech on or off for this session, or `/chitchat` followed by a command. The plugin's hooks module answers the command by running `scripts/chitchat` with the words typed after it, so no model turn runs, and it runs at once even while Claude is still replying, so `/chitchat stop` cuts speech mid-turn. Its output is shown to you and is not sent to Claude.
 
 | Command | Effect |
 |---|---|
@@ -57,8 +57,15 @@ Control speech with the plugin's `chitchat` skill: type `/chitchat` to turn spee
 | `/chitchat speed [RATE]` | Show or set playback rate, 0.5 to 2 (default 1.1, or `CHITCHAT_SPEED`) |
 | `/chitchat name [NAME]` | Show or set the name said before this session's speech while it is not focused; `name --clear` goes back to the tmux window name |
 | `/chitchat stop` | Stop this session's speech |
+| `/chitchat server` | Show the speech server's state, without starting one |
 
-The script also runs directly, as `scripts/chitchat COMMAND`, where no command means `status`. It finds its session from `CLAUDE_CODE_SESSION_ID`, which commands run by Claude in a session carry, so outside a session only `voice` (to list) and `stop` (which stops every session) work.
+The script also runs directly, as `scripts/chitchat COMMAND`, where no command means `status`. It finds its session from `CLAUDE_CODE_SESSION_ID`, which commands run by Claude in a session carry, so outside a session only `voice` (to list), `stop` (which stops every session), and `server` work.
+
+Claude cannot type a slash command, so an agent that should speak, such as one you supervise in tagged mode, runs the script itself with its Bash tool. The script is in the plugin folder: the clone, for a folder marketplace, or else the `installPath` that `~/.claude/plugins/installed_plugins.json` lists for `chitchat@chitchat`:
+
+```
+"$(jq -r '.plugins["chitchat@chitchat"][0].installPath' ~/.claude/plugins/installed_plugins.json)/scripts/chitchat" on tagged
+```
 
 Each session speaks its messages in order. Sessions that speak at the same time take turns in the order their messages arrived, and a new prompt silences whatever its session had left to say. Text written before a tool call is spoken as the call starts, so a turn's progress is heard as it goes on.
 
@@ -86,16 +93,18 @@ The server takes its environment, including the `CHITCHAT_` variables, from the 
 |---|---|
 | `CHITCHAT_IDLE_SECONDS` | Seconds the server waits with nothing queued before it exits (default 600) |
 
+`/chitchat server` asks the running server for its state: its version, process ID, how long it has run, how long until it exits if nothing more is queued, the voices it has prepared, the session it is speaking for, and for each session how many messages are queued to play and how many are held until you look at it. With no server running it says so and starts none. A server older than the plugin takes the request as a ring, so it finishes what it is saying and exits, and the next speech starts the newer one.
+
 Its log is `${XDG_STATE_HOME:-~/.local/state}/chitchat/logs/server`.
 
 ## How it fits together
 
-- `skills/chitchat/SKILL.md`: the skill that runs the script's commands
-- `scripts/chitchat`: the command line the hooks and skill run, and the speech server it starts
+- `scripts/chitchat`: the command line the hooks and `/chitchat` run, and the speech server it starts
 - `scripts/chitchat_test.py`: scheduling, focus, naming, and server lifecycle tests, without the model, run with `python3 scripts/chitchat_test.py -v`
 - `scripts/chitchat_bench.py`: times a message from hand-over to playback for two copies of the script, such as main's and a branch's, playing silently
 - `hooks/hooks.json`: Stop, UserPromptSubmit, and SessionEnd hooks that call the script; each returns at once while no session has speech on
-- `hooks/register.ts`: a hooks module that strips `<speak>` and `<announce>` tags from drawn replies, leaving the stored transcript, which the script reads, unchanged. It also reads each response as it streams and hands the text written before a tool call to the script as the call starts, since that text reaches the transcript only after the call has run
+- `hooks/register.ts`: a hooks module that strips `<speak>` and `<announce>` tags from drawn replies, leaving the stored transcript, which the script reads, unchanged. It also reads each response as it streams and hands the text written before a tool call to the script as the call starts, since that text reaches the transcript only after the call has run. It registers `/chitchat` and answers it by running the script
+- `hooks/command.ts`: how `/chitchat`'s arguments become the script's, and how its result is shown, tested by `claude plugin test`
 
 ## License
 
