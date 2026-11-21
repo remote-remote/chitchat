@@ -12,6 +12,15 @@ Speech is enabled per Claude Code session. Each session speaks its messages in
 order, one at a time. Sessions that speak at the same time take turns. A new
 prompt silences whatever its session had left to say.
 
+One speech server speaks for every session. Hooks write each message to a queue
+file for its session and ring the server over a Unix socket in the state
+directory; the first ring with no server listening starts one. The server loads
+the model once, prepares each voice the first time it is asked for, and exits
+after $CHITCHAT_IDLE_SECONDS (default 600) with nothing queued. Queue files stay
+on disk until spoken, so a server that crashes leaves them for the next. Each
+request carries the plugin's version, and a server older than the client
+finishes what it is saying and exits, leaving the client to start the newer one.
+
 A voice is a WAV sample in $XDG_DATA_HOME/chitchat/voices, named for its
 file: voices/data.wav is the voice "data". Chatterbox needs more than 5 seconds
 and uses only the first 15. $CHITCHAT_VOICE names the default voice, and
@@ -49,6 +58,7 @@ voice, speed, name, or stop.
   chitchat prompt                 UserPromptSubmit hook: ask for speakable replies
   chitchat end                    SessionEnd hook: forget the session
   chitchat say [SESSION]          speak text read from stdin, focused or not
+  chitchat serve                  the speech server; the first message with none listening starts it
 """
 
 import fcntl
@@ -56,12 +66,14 @@ import json
 import os
 import queue
 import re
-import signal
+import select
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,6 +83,10 @@ DEFAULT_SPEED = os.environ.get("CHITCHAT_SPEED", "1.1")
 DEFAULT_VOICE = os.environ.get("CHITCHAT_VOICE", "default")
 DUCK_LEVEL = os.environ.get("CHITCHAT_DUCK", "30")
 FOCUS_GATE = os.environ.get("CHITCHAT_FOCUS", "on").strip().lower() != "off"
+try:
+    IDLE_SECONDS = max(float(os.environ.get("CHITCHAT_IDLE_SECONDS", "600")), 0.0)
+except ValueError:
+    IDLE_SECONDS = 600.0
 
 DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "chitchat"
 VOICES = DATA / "voices"
@@ -79,19 +95,22 @@ ENABLED = STATE / "sessions"
 CHOSEN = STATE / "chosen-voices"
 SPEEDS = STATE / "speeds"
 NAMES = STATE / "names"
-PIDS = STATE / "pids"
 LOGS = STATE / "logs"
 QUEUES = STATE / "queues"
-WORKERS = STATE / "workers"
 OFFSETS = STATE / "offsets"
 PANES = STATE / "panes"
-# A session whose worker is holding speech until it is focused; it counts as silent.
-HELD = STATE / "held"
-PLAY_LOCK = STATE / "play.lock"
-# Spotify's volume from before speech lowered it, kept until it is restored, so a run
-# that is killed or crashes is restored by the next one.
+SOCKET = STATE / "server.sock"
+# Held by the server listening on SOCKET, so only one listens.
+LISTEN_LOCK = STATE / "listen.lock"
+# Held by the server that plays audio and sets Spotify's volume. A server that
+# replaces an older one waits for it while the older one finishes what it is saying.
+AUDIO_LOCK = STATE / "audio.lock"
+# Held by a client while it starts a server, so sessions ringing at once start one.
+START_LOCK = STATE / "start.lock"
+# Spotify's volume from before speech lowered it, kept until it is restored, so a
+# server that is killed or crashes is restored later.
 DUCKED = STATE / "ducked"
-DUCK_LOCK = STATE / "duck.lock"
+PLUGIN = Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"
 # Keys in a session's offsets; real keys are paths. SPOKEN is the last reply the Stop
 # hook spoke, and SAID the texts pretool spoke this turn.
 SPOKEN = "spoken"
@@ -123,16 +142,30 @@ hidden on screen."""
 VOICE_TAG = re.compile(r"<(speak|announce)>(.*?)(?:</\1>|\Z)", re.S | re.I)
 ANNOUNCE_TAG = re.compile(r"</?announce>", re.I)
 ANNOUNCEMENT = re.compile(r"<announce>.*?(?:</announce>|\Z)", re.S | re.I)
-# How often a worker holding speech for an unfocused session checks for the listener.
+# How often the server checks whether a session holding speech is focused again.
 POLL_SECONDS = 0.5
+# How often the server checks whether it has been idle long enough to exit.
+IDLE_CHECK_SECONDS = 1.0
+# How long a client waits for a server it started to listen.
+STARTUP_SECONDS = 5.0
+
+
+def plugin_version() -> str:
+    try:
+        return json.loads(PLUGIN.read_text())["version"]
+    except (OSError, ValueError, KeyError):
+        return "0"
+
+
+VERSION = plugin_version()
 
 
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
-    for d in (ENABLED, CHOSEN, SPEEDS, NAMES, PIDS, LOGS, QUEUES, WORKERS, OFFSETS, PANES, HELD, VOICES):
+    for d in (ENABLED, CHOSEN, SPEEDS, NAMES, LOGS, QUEUES, OFFSETS, PANES, VOICES):
         d.mkdir(parents=True, exist_ok=True)
-    if cmd != "worker" and DUCKED.exists():
-        restore()
+    if cmd != "serve" and DUCKED.exists():
+        restore_unowned()
     if cmd in ("on", "off", "toggle", "status"):
         toggle(cmd, current_session(), sys.argv[2] if len(sys.argv) > 2 else "")
     elif cmd == "voice":
@@ -142,9 +175,7 @@ def main() -> None:
     elif cmd == "name":
         choose_name(" ".join(sys.argv[2:]).strip() or None)
     elif cmd == "stop":
-        session = os.environ.get("CLAUDE_CODE_SESSION_ID")
-        for s in [session] if session else [p.name for p in PIDS.iterdir()]:
-            stop(s)
+        stop(os.environ.get("CLAUDE_CODE_SESSION_ID") or None)
     elif cmd == "hook":
         hook(json.load(sys.stdin))
     elif cmd == "pretool":
@@ -176,8 +207,8 @@ def main() -> None:
     elif cmd == "say":
         text = sys.stdin.read()
         enqueue(sys.argv[2] if len(sys.argv) > 2 else "manual", text, text, "")
-    elif cmd == "worker":
-        worker(sys.argv[2])
+    elif cmd == "serve":
+        serve()
     else:
         sys.exit(__doc__)
 
@@ -446,7 +477,7 @@ def plain(md: str) -> str:
 
 
 def enqueue(session: str, text: str, announce: str = "", rest: str | None = None) -> None:
-    """Add text to the session's queue and make sure a worker is speaking it.
+    """Add text to the session's queue and ring the server to speak it.
 
     announce is the part of text that is spoken even while the session is not
     focused, and rest is text without it, said once the announcement has been."""
@@ -458,81 +489,103 @@ def enqueue(session: str, text: str, announce: str = "", rest: str | None = None
     entry = {"text": text, "announce": announce, "rest": text if rest is None else rest}
     item.with_suffix(".tmp").write_text(json.dumps(entry))
     item.with_suffix(".tmp").rename(item)
-    # A worker that is already running exits at once; see worker() for why that is safe.
-    subprocess.Popen(
-        [sys.executable, __file__, "worker", session],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    call({"op": "ring"})
 
 
-def worker(session: str) -> None:
-    """Speak the session's queue in order until it is empty.
+def stop(session: str | None) -> None:
+    """Drop the session's queue, or every session's with None, and cut its speech
+    if it is playing."""
+    if call({"op": "stop", "session": session}, start=False) is None:
+        # With no server listening, nothing is playing, so the queue is all there is.
+        drop(session)
 
-    Only the worker holding the session's lock speaks. After releasing it, the
-    worker looks at the queue once more: an item added while it held the lock
-    found the lock taken and started no worker of its own, so this one must
-    take it.
 
-    Focus is checked as each item comes up, so speech queued while focused stops
-    when the listener looks away. While the session is not focused, the worker
-    says any new announcements and otherwise waits, holding the rest in order
-    until the session is focused again."""
-    pending = QUEUES / session
-    model = None
-    loaded_voice = None
-    logging = False
+def call(request: dict, start: bool = True) -> dict | None:
+    """Send a request to the server and return its reply, or None if none answered.
 
-    def say(text: str) -> None:
-        nonlocal model, loaded_voice
-        if not text:
-            return
-        if model is None:
-            model = load()
-        # The choice is read per item, so a change applies from the next message.
-        if (chosen := voice(session)) != loaded_voice:
-            model.prepare_conditionals(str(VOICES / f"{chosen}.wav"))
-            loaded_voice = chosen
-        speak(model, text, session)
+    With start, a client that finds no server starts one. A server older than this
+    client replies that it will restart, and the client starts the newer one in its
+    place whether or not start is set. The new server reads the queues from disk,
+    so the request is not sent again."""
+    reply = send(request)
+    if reply is None and not start:
+        return None
+    if reply is None or reply.get("restart"):
+        with open(START_LOCK, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            # Another client may have started one while this one waited for the lock.
+            if not ready(send({"op": "ring"})):
+                launch()
+                deadline = time.monotonic() + STARTUP_SECONDS
+                while not ready(send({"op": "ring"})) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+    return reply
 
-    while True:
-        with open(WORKERS / session, "w") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return
-            (PIDS / session).write_text(str(os.getpid()))
-            if not logging:
-                # Each worker replaces the session's log, so it holds only its own output.
-                log = os.open(LOGS / session, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-                os.dup2(log, 1)
-                os.dup2(log, 2)
-                logging = True
-            while item := next_item(pending):
-                (HELD / session).unlink(missing_ok=True)
-                where = pane(session)
-                if where.focused:
-                    say(take(item))
-                    continue
-                for waiting in sorted(pending.glob("*.txt")):
-                    if text := take_announcement(waiting):
-                        who = name(session, where.window)
-                        # A line of its own is a clip of its own, so a pause follows the name.
-                        say(f"{who}.\n{text}" if who else text)
-                # A held session counts as silent, so other sessions play and the
-                # music comes back up while this one waits; play() ducks it again.
-                (HELD / session).touch()
-                restore()
-                time.sleep(POLL_SECONDS)
-            (HELD / session).unlink(missing_ok=True)
-            pidfile = PIDS / session
-            if pidfile.exists() and pidfile.read_text() == str(os.getpid()):
-                pidfile.unlink()
-        if not next_item(pending):
-            restore()
-            return
+
+def ready(reply: dict | None) -> bool:
+    return reply is not None and not reply.get("restart")
+
+
+def send(request: dict) -> dict | None:
+    """One request and its reply, each a line of JSON; None if no server answers."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(5)
+            conn.connect(str(SOCKET))
+            conn.sendall((json.dumps({**request, "version": VERSION}) + "\n").encode())
+            return json.loads(read_line(conn))
+    except (OSError, ValueError):
+        return None
+
+
+def read_line(conn: socket.socket) -> bytes:
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+def launch() -> None:
+    """Start a server, detached from the session so it outlives it. Each server
+    empties the log; appending keeps an older server's last lines readable."""
+    log = os.open(LOGS / "server", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND, 0o644)
+    try:
+        subprocess.Popen(
+            [sys.executable, __file__, "serve"],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            cwd="/",
+            start_new_session=True,
+        )
+    finally:
+        os.close(log)
+
+
+def newer(version: str, than: str) -> bool:
+    def parts(v: str) -> tuple[int, ...]:
+        return tuple(int(n) for n in re.findall(r"\d+", v))
+
+    return parts(version) > parts(than)
+
+
+def queued(session: str | None = None) -> list[tuple[str, Path]]:
+    """Queued items as (session, path), oldest first across sessions, since items
+    are named for the time they were queued."""
+    if session is not None:
+        dirs = [QUEUES / session]
+    else:
+        dirs = [d for d in QUEUES.iterdir() if d.is_dir()] if QUEUES.exists() else []
+    items = sorted((item.name, d.name, item) for d in dirs for item in d.glob("*.txt"))
+    return [(s, item) for _, s, item in items]
+
+
+def drop(session: str | None) -> None:
+    for _, item in queued(session):
+        item.unlink(missing_ok=True)
 
 
 def read_entry(item: Path) -> dict | None:
@@ -558,10 +611,14 @@ def take(item: Path) -> str:
 
 def take_announcement(item: Path) -> str:
     """Return an item's announcement if it has not been said, marking it said, so
-    the item keeps only the rest for when the session is focused."""
+    the item keeps only the rest for when the session is focused. An item with no
+    rest is done once announced."""
     entry = read_entry(item)
     if not entry or not entry.get("announce") or entry.get("announced"):
         return ""
+    if not entry.get("rest", "").strip():
+        item.unlink(missing_ok=True)
+        return entry["announce"]
     entry["announced"] = True
     tmp = item.with_suffix(".tmp")
     tmp.write_text(json.dumps(entry))
@@ -626,83 +683,300 @@ def tmux_pane(pane: str, socket: str) -> str | None:
     return run.stdout if run.returncode == 0 else None
 
 
-def next_item(pending: Path) -> Path | None:
-    items = sorted(pending.glob("*.txt")) if pending.exists() else []
-    return items[0] if items else None
+SPOKE, HELD, EMPTY = "spoke", "held", "empty"
+
+
+def serve() -> None:
+    sys.stdout.reconfigure(line_buffering=True)
+    server = Server()
+    if not server.listen():
+        return
+    print(f"chitchat {server.version}: serving", flush=True)
+    scheduler = threading.Thread(target=server.run)
+    scheduler.start()
+    server.accept()
+    scheduler.join()
+    print(f"chitchat {server.version}: exiting", flush=True)
+
+
+class Server:
+    """The one process that speaks for every session.
+
+    Requests are answered on one thread and speech is scheduled on another. The
+    queues live on disk, so the scheduler reads them as it goes, and a ring only
+    wakes it. self.lock guards taking an item off the queue against stop(), so a
+    stop either finds the item still queued or finds it being said and cuts it."""
+
+    def __init__(self, version: str = VERSION):
+        self.version = version
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        # Set by stop() to cut the item being said.
+        self.cancel = threading.Event()
+        self.closing = False
+        # The session whose item is being said, while one is.
+        self.current: str | None = None
+        self.player: subprocess.Popen | None = None
+        self.last_active = time.monotonic()
+        self.model = None
+        # Each voice's prepared conditionals, with the sample's mtime they came from.
+        self.voices: dict[str, tuple[int, object]] = {}
+        self.listener: socket.socket | None = None
+        self.listen_lock = None
+
+    def listen(self) -> bool:
+        """Take the socket, unless another server keeps it past the startup wait."""
+        lock = open(LISTEN_LOCK, "w")
+        deadline = time.monotonic() + STARTUP_SECONDS
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    lock.close()
+                    return False
+                time.sleep(0.05)
+        SOCKET.unlink(missing_ok=True)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(SOCKET))
+        listener.listen()
+        self.listener, self.listen_lock = listener, lock
+        return True
+
+    def close(self) -> None:
+        """Stop listening, so the next client starts a new server."""
+        if self.listener is None:
+            return
+        SOCKET.unlink(missing_ok=True)
+        self.listen_lock.close()
+        self.listener.close()
+        self.listener = self.listen_lock = None
+
+    def accept(self) -> None:
+        """Answer requests until the server is replaced, or idle with nothing queued."""
+        while not self.closing:
+            ready, _, _ = select.select([self.listener], [], [], IDLE_CHECK_SECONDS)
+            if ready:
+                self.answer()
+                continue
+            # Clients write the queue file before ringing, so under the lock an
+            # empty queue means no ring is on its way for anything queued.
+            with self.lock:
+                idle = time.monotonic() - self.last_active >= IDLE_SECONDS
+                if idle and self.current is None and not queued():
+                    self.closing = True
+        self.close()
+        self.wake.set()
+
+    def answer(self) -> None:
+        try:
+            conn, _ = self.listener.accept()
+        except OSError:
+            return
+        with conn:
+            try:
+                conn.settimeout(5)
+                reply = self.handle(json.loads(read_line(conn)))
+                if self.closing:
+                    # Closed before replying, so the client told to start a newer
+                    # server finds none listening.
+                    self.close()
+                conn.sendall((json.dumps(reply) + "\n").encode())
+            except (OSError, ValueError):
+                pass
+
+    def handle(self, request: dict) -> dict:
+        """Answer one request: a ring, which only wakes the scheduler, or a stop.
+        Either one from a newer client closes this server."""
+        with self.lock:
+            self.last_active = time.monotonic()
+            if request.get("op") == "stop":
+                self.stop(request.get("session"))
+            restart = newer(str(request.get("version", "")), self.version)
+            if restart:
+                self.closing = True
+        self.wake.set()
+        return {"version": self.version, "restart": restart}
+
+    def stop(self, session: str | None) -> None:
+        """Drop the session's queue, or every session's with None, and cut its
+        speech if it is being said. Called with self.lock held."""
+        drop(session)
+        if self.current is not None and session in (None, self.current):
+            self.cancel.set()
+            if self.player is not None:
+                self.player.terminate()
+
+    def run(self) -> None:
+        """Speak once this server owns the audio, until it closes."""
+        try:
+            with open(AUDIO_LOCK, "w") as lock:
+                while not self.closing:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        time.sleep(POLL_SECONDS)
+                else:
+                    return
+                try:
+                    self.schedule()
+                finally:
+                    restore()
+        except Exception:
+            traceback.print_exc()
+        finally:
+            # A scheduler that failed must not leave a server that answers but never speaks.
+            self.closing = True
+            self.wake.set()
+
+    def schedule(self) -> None:
+        """Speak the queues until the server closes, finishing the item being said."""
+        while not self.closing:
+            self.wake.clear()
+            state = self.step()
+            if state == SPOKE:
+                continue
+            # Held speech counts as silent, so the music comes back up while it waits.
+            restore()
+            if not self.wait(POLL_SECONDS if state == HELD else None):
+                return
+
+    def wait(self, seconds: float | None) -> bool:
+        """Wait for a ring, or the given seconds; False once the server is closing."""
+        self.wake.wait(seconds)
+        return not self.closing
+
+    def step(self) -> str:
+        """Say the next thing, and return SPOKE, or HELD when everything queued
+        waits for its session's focus, or EMPTY.
+
+        An announcement not yet said, from a session that is not focused, goes
+        first, starting with the session's name. Otherwise the oldest item from a
+        focused session is said whole, or without its announcement if that was
+        already said. Focus is checked each time, so speech queued while focused
+        waits once the listener looks away."""
+        items = queued()
+        if not items:
+            return EMPTY
+        panes = {session: pane(session) for session in {s for s, _ in items}}
+        with self.lock:
+            pick = None
+            for session, item in items:
+                if not panes[session].focused and (text := take_announcement(item)):
+                    who = name(session, panes[session].window)
+                    # A line of its own is a clip of its own, so a pause follows the name.
+                    pick = session, f"{who}.\n{text}" if who else text
+                    break
+            else:
+                for session, item in items:
+                    if panes[session].focused:
+                        pick = session, take(item)
+                        break
+            if pick is None:
+                return HELD
+            self.current = pick[0]
+            self.cancel.clear()
+        try:
+            self.say(*pick)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            with self.lock:
+                self.current = None
+                self.last_active = time.monotonic()
+        return SPOKE
+
+    def say(self, session: str, text: str) -> None:
+        if not text or self.cancel.is_set():
+            return
+        # The choice is read per item, so a change applies from the next message.
+        chosen = self.voice_for(session)
+        if chosen is None:
+            return
+        self.use_voice(chosen)
+        self.speak(text, session)
+
+    def voice_for(self, session: str) -> str | None:
+        """The session's voice, or the default when the chosen voice has no sample;
+        None, skipping the message, when the default has none either."""
+        chosen = voice(session)
+        if (VOICES / f"{chosen}.wav").exists():
+            return chosen
+        if chosen != DEFAULT_VOICE and (VOICES / f"{DEFAULT_VOICE}.wav").exists():
+            warn(f"no voice {chosen!r} in {VOICES}; speaking {session} in the default voice, {DEFAULT_VOICE!r}")
+            return DEFAULT_VOICE
+        missing = f"{chosen!r} or the default, {DEFAULT_VOICE!r}" if chosen != DEFAULT_VOICE else repr(chosen)
+        warn(f"no voice {missing} in {VOICES}; skipped a message from {session}")
+        return None
+
+    def use_voice(self, chosen: str) -> None:
+        """Give the model the voice, preparing it the first time it is asked for,
+        or again once its sample changes. prepare_conditionals leaves the voice in
+        the model's _conds, the only voice state generate() reads, so a voice
+        prepared before is swapped back in there."""
+        path = VOICES / f"{chosen}.wav"
+        mtime = path.stat().st_mtime_ns
+        if self.model is None:
+            self.model = load()
+        cached = self.voices.get(chosen)
+        if cached and cached[0] == mtime:
+            self.model._conds = cached[1]
+            return
+        self.model.prepare_conditionals(str(path))
+        self.voices[chosen] = (mtime, self.model._conds)
+
+    def speak(self, text: str, session: str) -> None:
+        import soundfile
+
+        clips: queue.Queue[Path | None] = queue.Queue()
+        player = threading.Thread(target=self.play, args=(clips, session))
+        player.start()
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                # Each line is generated on its own, so playback starts after the first
+                # line and the gap between clips, mostly afplay startup, falls at a line
+                # break. Turbo still splits a line longer than about 400 characters.
+                lines = [line for line in text.splitlines() if line.strip()]
+                results = (r for line in lines for r in self.model.generate(text=line))
+                for i, result in enumerate(results):
+                    if self.cancel.is_set():
+                        break
+                    clip = Path(tmp) / f"{i}.wav"
+                    soundfile.write(clip, result.audio, result.sample_rate)
+                    clips.put(clip)
+            finally:
+                clips.put(None)
+                player.join()
+
+    def play(self, clips: queue.Queue, session: str) -> None:
+        """Play clips as they are generated, until stop() cuts them."""
+        ducked = False
+        while (clip := clips.get()) is not None:
+            if self.cancel.is_set():
+                continue
+            if not ducked:
+                duck()
+                ducked = True
+            with self.lock:
+                if self.cancel.is_set():
+                    continue
+                # Turbo has no speed control, so playback sets the rate.
+                player = self.player = subprocess.Popen(["afplay", "-r", speed(session), "-q", "1", str(clip)])
+            player.wait()
+            with self.lock:
+                self.player = None
+
+
+def warn(message: str) -> None:
+    print(f"chitchat: {message}", file=sys.stderr, flush=True)
 
 
 def load():
     from mlx_audio.tts.utils import load_model
 
     return load_model(MODEL)
-
-
-def speak(model, text: str, session: str) -> None:
-    import soundfile
-
-    clips: queue.Queue[Path | None] = queue.Queue()
-    player = threading.Thread(target=play, args=(clips, session))
-    player.start()
-    with tempfile.TemporaryDirectory() as tmp:
-        try:
-            # Each line is generated on its own, so playback starts after the first
-            # line and the gap between clips, mostly afplay startup, falls at a line
-            # break. Turbo still splits a line longer than about 400 characters.
-            lines = [line for line in text.splitlines() if line.strip()]
-            results = (r for line in lines for r in model.generate(text=line))
-            for i, result in enumerate(results):
-                clip = Path(tmp) / f"{i}.wav"
-                soundfile.write(clip, result.audio, result.sample_rate)
-                clips.put(clip)
-        finally:
-            clips.put(None)
-            player.join()
-
-
-def play(clips: queue.Queue, session: str) -> None:
-    clip = clips.get()
-    if clip is None:
-        return
-    # Sessions take turns. Generation keeps going while this waits, and the lock is
-    # released when the process exits, including when stop() kills it.
-    with open(PLAY_LOCK, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        duck()
-        while clip is not None:
-            # Turbo has no speed control, so playback sets the rate.
-            subprocess.run(["afplay", "-r", speed(session), "-q", "1", str(clip)])
-            clip = clips.get()
-
-
-def stop(session: str) -> None:
-    """Drop the session's queue and kill its worker, with any afplay it started."""
-    for item in (QUEUES / session).glob("*.txt"):
-        item.unlink(missing_ok=True)
-    (HELD / session).unlink(missing_ok=True)
-    kill_worker(session)
-    restore()
-
-
-def kill_worker(session: str) -> None:
-    pidfile = PIDS / session
-    try:
-        pid = int(pidfile.read_text())
-    except (FileNotFoundError, ValueError):
-        return
-    pidfile.unlink(missing_ok=True)
-    if pid == os.getpid():
-        return
-    if is_chitchat(pid):
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-
-
-def is_chitchat(pid: int) -> bool:
-    """Guards against a reused pid: true only for a process that is still chitchat."""
-    ps = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True)
-    return "chitchat" in ps.stdout
 
 
 def duck_level() -> int | None:
@@ -715,51 +989,41 @@ def duck_level() -> int | None:
 
 
 def duck() -> None:
-    """Lower Spotify for speech. Ducking is global: the first speaker saves the
-    volume and lowers it, and later speakers find it saved and leave it alone."""
+    """Lower Spotify for speech, saving its volume first. A volume already saved is
+    from speech still going on, or from a server that died before restoring it."""
     level = duck_level()
-    if level is None:
+    if level is None or DUCKED.exists():
         return
-    with open(DUCK_LOCK, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if DUCKED.exists():
-            return
-        volume = spotify_volume()
-        if volume is None:
-            return
-        # Saved before lowering, so a crash in between restores a volume, not loses one.
-        DUCKED.write_text(str(volume))
-        if volume > level:
-            spotify_volume(level)
+    volume = spotify_volume()
+    if volume is None:
+        return
+    # Saved before lowering, so a crash in between restores a volume, not loses one.
+    DUCKED.write_text(str(volume))
+    if volume > level:
+        spotify_volume(level)
 
 
 def restore() -> None:
-    """Put Spotify back at its saved volume once no session has speech playing or
-    queued. A volume the user changed while ducked is overwritten, not fought."""
-    with open(DUCK_LOCK, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if not DUCKED.exists() or speaking():
+    """Put Spotify back at its saved volume. A volume the user changed while ducked
+    is overwritten, not fought."""
+    if not DUCKED.exists():
+        return
+    try:
+        spotify_volume(int(DUCKED.read_text()))
+    except ValueError:
+        pass
+    DUCKED.unlink(missing_ok=True)
+
+
+def restore_unowned() -> None:
+    """Restore Spotify for a server that died while it was lowered. A live server
+    holds the audio lock and restores it itself."""
+    with open(AUDIO_LOCK, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
             return
-        try:
-            spotify_volume(int(DUCKED.read_text()))
-        except ValueError:
-            pass
-        DUCKED.unlink()
-
-
-def speaking() -> bool:
-    """Whether any session that is not holding speech has a live worker or queued text."""
-    held = {p.name for p in HELD.glob("*")}
-    for pidfile in PIDS.glob("*"):
-        if pidfile.name in held:
-            continue
-        try:
-            if is_chitchat(int(pidfile.read_text())):
-                return True
-        except (FileNotFoundError, ValueError):
-            pass
-    queued = [*QUEUES.glob("*/*.txt"), *QUEUES.glob("*/*.tmp")]
-    return any(item.parent.name not in held for item in queued)
+        restore()
 
 
 def spotify_volume(level: int | None = None) -> int | None:
